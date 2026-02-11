@@ -99,6 +99,7 @@ pub mod lights;
 pub mod occluders;
 pub mod visibility;
 
+pub mod composite_sprite;
 pub mod extract;
 pub mod nodes;
 pub mod phases;
@@ -112,6 +113,7 @@ pub(crate) use phases::*;
 
 pub mod prelude {
     pub use crate::app::{FireflyGizmosPlugin, FireflyPlugin};
+    pub use crate::composite_sprite::CompositeSprite;
     pub use crate::data::{FireflyConfig, NormalMode};
     pub use crate::lights::{Falloff, LightHeight, PointLight2d};
     pub use crate::occluders::Occluder2d;

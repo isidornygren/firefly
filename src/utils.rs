@@ -1,6 +1,6 @@
 use bevy::{platform::collections::HashSet, prelude::*, sprite::Anchor};
 
-use crate::sprites::ExtractedSlice;
+use crate::{prelude::CompositeSprite, sprites::ExtractedSlice};
 
 // use crate::sprites::stencil::ExtractedSlice;
 /// Component storing texture slices for tiled or sliced sprite entities
@@ -53,6 +53,7 @@ impl ComputedTextureSlices {
 #[must_use]
 fn compute_sprite_slices(
     sprite: &Sprite,
+    maybe_composite_sprite: Option<&CompositeSprite>,
     images: &Assets<Image>,
     atlas_layouts: &Assets<TextureAtlasLayout>,
 ) -> Option<ComputedTextureSlices> {
@@ -77,6 +78,25 @@ fn compute_sprite_slices(
             (size, rect)
         }
     };
+
+    if let Some(composite_sprite) = maybe_composite_sprite {
+        let layout = atlas_layouts.get(&sprite.texture_atlas.as_ref().unwrap().layout)?;
+        let slices = composite_sprite
+            .slices
+            .iter()
+            .map(|slice| {
+                let slice_rect = layout.textures.get(slice.index).unwrap().as_rect();
+
+                TextureSlice {
+                    texture_rect: slice_rect,
+                    draw_size: slice_rect.size(),
+                    offset: slice.offset,
+                }
+            })
+            .collect();
+        return Some(ComputedTextureSlices(slices));
+    }
+
     let slices = match &sprite.image_mode {
         SpriteImageMode::Sliced(slicer) => slicer.compute_slices(texture_rect, sprite.custom_size),
         SpriteImageMode::Tiled {
@@ -108,7 +128,7 @@ pub(crate) fn compute_slices_on_asset_event(
     mut events: MessageReader<AssetEvent<Image>>,
     images: Res<Assets<Image>>,
     atlas_layouts: Res<Assets<TextureAtlasLayout>>,
-    sprites: Query<(Entity, &Sprite)>,
+    sprites: Query<(Entity, &Sprite, Option<&CompositeSprite>)>,
 ) {
     // We store the asset ids of added/modified image assets
     let added_handles: HashSet<_> = events
@@ -122,14 +142,16 @@ pub(crate) fn compute_slices_on_asset_event(
         return;
     }
     // We recompute the sprite slices for sprite entities with a matching asset handle id
-    for (entity, sprite) in &sprites {
-        if !sprite.image_mode.uses_slices() {
+    for (entity, sprite, maybe_composite_sprite) in &sprites {
+        if !sprite.image_mode.uses_slices() && maybe_composite_sprite.is_none() {
             continue;
         }
         if !added_handles.contains(&sprite.image.id()) {
             continue;
         }
-        if let Some(slices) = compute_sprite_slices(sprite, &images, &atlas_layouts) {
+        if let Some(slices) =
+            compute_sprite_slices(sprite, maybe_composite_sprite, &images, &atlas_layouts)
+        {
             commands.entity(entity).insert(slices);
         }
     }
@@ -140,13 +162,15 @@ pub(crate) fn compute_slices_on_sprite_change(
     mut commands: Commands,
     images: Res<Assets<Image>>,
     atlas_layouts: Res<Assets<TextureAtlasLayout>>,
-    changed_sprites: Query<(Entity, &Sprite), Changed<Sprite>>,
+    changed_sprites: Query<(Entity, &Sprite, Option<&CompositeSprite>), Changed<Sprite>>,
 ) {
-    for (entity, sprite) in &changed_sprites {
-        if !sprite.image_mode.uses_slices() {
+    for (entity, sprite, maybe_composite_sprite) in &changed_sprites {
+        if !sprite.image_mode.uses_slices() && maybe_composite_sprite.is_none() {
             continue;
         }
-        if let Some(slices) = compute_sprite_slices(sprite, &images, &atlas_layouts) {
+        if let Some(slices) =
+            compute_sprite_slices(sprite, maybe_composite_sprite, &images, &atlas_layouts)
+        {
             commands.entity(entity).insert(slices);
         }
     }
