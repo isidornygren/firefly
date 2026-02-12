@@ -91,6 +91,21 @@ fn compute_sprite_slices(
             };
             slice.tiled(*stretch_value, (*tile_x, *tile_y))
         }
+        SpriteImageMode::Instances(instances) => {
+            let layout = atlas_layouts.get(&sprite.texture_atlas.as_ref()?.layout)?;
+
+            instances
+                .iter()
+                .map(|instance| {
+                    let slice_rect = layout.textures.get(instance.index)?.as_rect();
+                    Some(TextureSlice {
+                        offset: instance.offset,
+                        texture_rect: slice_rect,
+                        draw_size: slice_rect.size(),
+                    })
+                })
+                .collect::<Option<Vec<TextureSlice>>>()?
+        }
         SpriteImageMode::Auto => {
             unreachable!("Slices should not be computed for SpriteImageMode::Stretch")
         }
