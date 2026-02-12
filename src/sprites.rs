@@ -8,12 +8,15 @@ use std::ops::Range;
 
 use crate::phases::SpritePhase;
 use crate::pipelines::SpritePipeline;
+use crate::sprite::FireflySprite;
 use crate::utils::{compute_slices_on_asset_event, compute_slices_on_sprite_change};
 
 use bevy::asset::{AssetEventSystems, AssetPath};
 use bevy::image::ImageLoaderSettings;
 use bevy::render::RenderSystems;
-use bevy::sprite_render::{SpritePipelineKey, SpriteSystems, queue_material2d_meshes};
+use bevy::sprite_render::{
+    ExtractedSlice, SpritePipelineKey, SpriteSystems, queue_material2d_meshes,
+};
 use bevy::{
     core_pipeline::{
         core_2d::{AlphaMask2d, Opaque2d},
@@ -43,13 +46,7 @@ use bevy::{
 use bytemuck::{Pod, Zeroable};
 use fixedbitset::FixedBitSet;
 
-pub(crate) struct ExtractedSlice {
-    pub offset: Vec2,
-    pub rect: Rect,
-    pub size: Vec2,
-}
-
-pub(crate) struct ExtractedSprite {
+pub(crate) struct ExtractedFireflySprite {
     pub main_entity: Entity,
     pub render_entity: Entity,
     pub transform: GlobalTransform,
@@ -60,11 +57,11 @@ pub(crate) struct ExtractedSprite {
     pub normal_handle_id: Option<AssetId<Image>>,
     pub flip_x: bool,
     pub flip_y: bool,
-    pub kind: ExtractedSpriteKind,
+    pub kind: ExtractedFireflySpriteKind,
     pub height: f32,
 }
 
-pub(crate) enum ExtractedSpriteKind {
+pub(crate) enum ExtractedFireflySpriteKind {
     /// A single sprite with custom sizing and scaling options
     Single {
         anchor: Vec2,
@@ -78,13 +75,13 @@ pub(crate) enum ExtractedSpriteKind {
 }
 
 #[derive(Resource, Default)]
-pub(crate) struct ExtractedSprites {
+pub(crate) struct ExtractedFireflySprites {
     //pub sprites: HashMap<(Entity, MainEntity), ExtractedSprite>,
-    pub sprites: Vec<ExtractedSprite>,
+    pub sprites: Vec<ExtractedFireflySprite>,
 }
 
 #[derive(Resource, Default)]
-pub(crate) struct ExtractedSlices {
+pub(crate) struct ExtractedFireflySlices {
     pub slices: Vec<ExtractedSlice>,
 }
 
@@ -225,8 +222,8 @@ impl Plugin for SpritesPlugin {
                 .init_resource::<ImageBindGroups>()
                 .init_resource::<DrawFunctions<SpritePhase>>()
                 .init_resource::<SpriteMeta>()
-                .init_resource::<ExtractedSprites>()
-                .init_resource::<ExtractedSlices>()
+                .init_resource::<ExtractedFireflySprites>()
+                .init_resource::<ExtractedFireflySlices>()
                 .init_resource::<SpriteAssetEvents>()
                 .add_render_command::<SpritePhase, DrawSprite>()
                 .init_resource::<ViewSortedRenderPhases<SpritePhase>>()
@@ -257,7 +254,7 @@ fn queue_sprites(
     pipeline: Res<SpritePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<SpritePipeline>>,
     pipeline_cache: Res<PipelineCache>,
-    extracted_sprites: Res<ExtractedSprites>,
+    extracted_sprites: Res<ExtractedFireflySprites>,
     mut phases: ResMut<ViewSortedRenderPhases<SpritePhase>>,
     mut views: Query<(
         &RenderVisibleEntities,
@@ -305,7 +302,7 @@ fn queue_sprites(
         view_entities.clear();
         view_entities.extend(
             visible_entities
-                .iter::<Sprite>()
+                .iter::<FireflySprite>()
                 .map(|(_, e)| e.index_u32() as usize),
         );
 

@@ -12,7 +12,9 @@ use bevy::{
         view::{NoIndirectDrawing, RetainedViewEntity},
     },
     sprite::Anchor,
-    sprite_render::SpriteSystems,
+    sprite_render::{
+        ExtractedSlices, ExtractedSprite, ExtractedSpriteKind, ExtractedSprites, SpriteSystems,
+    },
 };
 
 use crate::{
@@ -23,9 +25,10 @@ use crate::{
     occluders::ExtractedOccluder,
     phases::SpritePhase,
     prelude::Occluder2d,
+    sprite::FireflySprite,
     sprites::{
-        ExtractedSlices, ExtractedSprite, ExtractedSpriteKind, ExtractedSprites, NormalMap,
-        SpriteAssetEvents, SpriteHeight,
+        ExtractedFireflySlices, ExtractedFireflySprite, ExtractedFireflySpriteKind,
+        ExtractedFireflySprites, NormalMap, SpriteAssetEvents, SpriteHeight,
     },
     visibility::{NotVisible, OccluderAabb, VisibilityTimer},
 };
@@ -44,7 +47,7 @@ impl Plugin for ExtractPlugin {
             ExtractSchedule,
             (
                 extract_camera_phases,
-                extract_sprites.in_set(SpriteSystems::ExtractSprites),
+                extract_sprites.after(SpriteSystems::ExtractSprites),
                 extract_sprite_events,
                 extract_world_data,
                 extract_lights,
@@ -100,7 +103,9 @@ fn extract_sprite_events(
 }
 
 fn extract_sprites(
+    mut extracted_firefly_sprites: ResMut<ExtractedFireflySprites>,
     mut extracted_sprites: ResMut<ExtractedSprites>,
+    mut extracted_firefly_slices: ResMut<ExtractedFireflySlices>,
     mut extracted_slices: ResMut<ExtractedSlices>,
     texture_atlases: Extract<Res<Assets<TextureAtlasLayout>>>,
     sprite_query: Extract<
@@ -108,7 +113,7 @@ fn extract_sprites(
             Entity,
             RenderEntity,
             &ViewVisibility,
-            &Sprite,
+            &FireflySprite,
             &Anchor,
             Option<&SpriteHeight>,
             Option<&NormalMap>,
@@ -117,8 +122,8 @@ fn extract_sprites(
         )>,
     >,
 ) {
-    extracted_sprites.sprites.clear();
-    extracted_slices.slices.clear();
+    extracted_firefly_sprites.sprites.clear();
+    extracted_firefly_slices.slices.clear();
     for (
         main_entity,
         render_entity,
@@ -138,25 +143,42 @@ fn extract_sprites(
         let height = height.map_or(0., |h| h.0);
 
         if let Some(slices) = slices {
-            let start = extracted_slices.slices.len();
+            let start = extracted_firefly_slices.slices.len();
+            extracted_firefly_slices
+                .slices
+                .extend(slices.extract_slices(sprite, anchor));
             extracted_slices
                 .slices
                 .extend(slices.extract_slices(sprite, anchor));
-            let end = extracted_slices.slices.len();
+            let end = extracted_firefly_slices.slices.len();
+            extracted_firefly_sprites
+                .sprites
+                .push(ExtractedFireflySprite {
+                    main_entity,
+                    render_entity,
+
+                    transform: *transform,
+                    flip_x: sprite.flip_x,
+                    flip_y: sprite.flip_y,
+                    image_handle_id: sprite.image.id(),
+                    normal_handle_id: normal_map.map(|x| x.handle().id()),
+                    kind: ExtractedFireflySpriteKind::Slices {
+                        indices: start..end,
+                    },
+                    height,
+                });
             extracted_sprites.sprites.push(ExtractedSprite {
                 main_entity,
                 render_entity,
-
+                color: sprite.color.into(),
                 transform: *transform,
                 flip_x: sprite.flip_x,
                 flip_y: sprite.flip_y,
                 image_handle_id: sprite.image.id(),
-                normal_handle_id: normal_map.and_then(|x| Some(x.handle().id())),
                 kind: ExtractedSpriteKind::Slices {
                     indices: start..end,
                 },
-                height,
-            });
+            })
         } else {
             let atlas_rect = sprite
                 .texture_atlas
@@ -174,14 +196,33 @@ fn extract_sprites(
             };
 
             // PERF: we don't check in this function that the `Image` asset is ready, since it should be in most cases and hashing the handle is expensive
+            extracted_firefly_sprites
+                .sprites
+                .push(ExtractedFireflySprite {
+                    main_entity,
+                    render_entity,
+                    transform: *transform,
+                    flip_x: sprite.flip_x,
+                    flip_y: sprite.flip_y,
+                    image_handle_id: sprite.image.id(),
+                    normal_handle_id: normal_map.map(|x| x.handle().id()),
+                    kind: ExtractedFireflySpriteKind::Single {
+                        anchor: anchor.as_vec(),
+                        rect,
+                        scaling_mode: sprite.image_mode.scale(),
+                        // Pass the custom size
+                        custom_size: sprite.custom_size,
+                    },
+                    height,
+                });
             extracted_sprites.sprites.push(ExtractedSprite {
                 main_entity,
                 render_entity,
+                color: sprite.color.into(),
                 transform: *transform,
                 flip_x: sprite.flip_x,
                 flip_y: sprite.flip_y,
                 image_handle_id: sprite.image.id(),
-                normal_handle_id: normal_map.and_then(|x| Some(x.handle().id())),
                 kind: ExtractedSpriteKind::Single {
                     anchor: anchor.as_vec(),
                     rect,
@@ -189,7 +230,6 @@ fn extract_sprites(
                     // Pass the custom size
                     custom_size: sprite.custom_size,
                 },
-                height,
             });
         }
     }
@@ -230,7 +270,7 @@ fn extract_lights(
 
         let pos = transform.translation().truncate() - vec2(0.0, height.0) + light.offset.xy();
         commands.entity(entity).insert(ExtractedPointLight {
-            pos: pos,
+            pos,
             color: light.color,
             intensity: light.intensity,
             range: light.range,

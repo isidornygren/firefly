@@ -1,10 +1,5 @@
 use bevy::{
-    color::palettes::css::RED,
-    pbr::UvChannel,
-    prelude::*,
-    render::view::Hdr,
-    sprite::{Anchor, SpriteInstance},
-    window::PrimaryWindow,
+    color::palettes::css::RED, prelude::*, render::view::Hdr, sprite::Anchor, window::PrimaryWindow,
 };
 use bevy_firefly::{data::NormalMode, prelude::*};
 
@@ -46,20 +41,20 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     ));
 
     commands.spawn((
-        Sprite {
+        FireflySprite {
             image: asset_server.load("composite_sheet.png"),
             texture_atlas: Some(TextureAtlas {
                 layout,
                 ..Default::default()
             }),
-            image_mode: SpriteImageMode::Instances(vec![
+            image_mode: FireflySpriteImageMode::Instances(vec![
                 SpriteInstance {
                     index: 0,
-                    offset: Vec2::new(0., 0.),
+                    offset: Vec2::new(10., 0.),
                 },
                 SpriteInstance {
                     index: 1,
-                    offset: Vec2::new(0., -10.),
+                    offset: Vec2::new(-10., -10.),
                 },
             ]),
             ..Default::default()
@@ -71,7 +66,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     ));
 
     commands.spawn((
-        Sprite::from_image(asset_server.load("bonfire.png")),
+        FireflySprite::from_image(asset_server.load("bonfire.png")),
         PointLight2d {
             intensity: 3.,
             range: 100.,
@@ -85,7 +80,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 }
 
 // setting the sprite's z in relation to their y, so that Bevy's sprite renderer and firefly sort them properly.
-fn z_sorting(mut sprites: Query<&mut Transform, With<Sprite>>) {
+fn z_sorting(mut sprites: Query<&mut Transform, With<FireflySprite>>) {
     for mut transform in &mut sprites {
         transform.translation.z = -transform.translation.y;
     }
@@ -95,7 +90,7 @@ fn z_sorting(mut sprites: Query<&mut Transform, With<Sprite>>) {
 struct Dragged(pub Option<Entity>);
 
 fn drag_objects(
-    mut objects: Query<(Entity, &mut Transform), With<Sprite>>,
+    mut objects: Query<(Entity, &mut Transform), With<FireflySprite>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform)>,
     buttons: Res<ButtonInput<MouseButton>>,

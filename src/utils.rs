@@ -1,6 +1,8 @@
-use bevy::{platform::collections::HashSet, prelude::*, sprite::Anchor};
+use bevy::{
+    platform::collections::HashSet, prelude::*, sprite::Anchor, sprite_render::ExtractedSlice,
+};
 
-use crate::sprites::ExtractedSlice;
+use crate::sprite::{FireflySprite, FireflySpriteImageMode};
 
 // use crate::sprites::stencil::ExtractedSlice;
 /// Component storing texture slices for tiled or sliced sprite entities
@@ -18,7 +20,7 @@ impl ComputedTextureSlices {
     #[must_use]
     pub(crate) fn extract_slices<'a>(
         &'a self,
-        sprite: &'a Sprite,
+        sprite: &'a FireflySprite,
         anchor: &'a Anchor,
     ) -> impl ExactSizeIterator<Item = ExtractedSlice> + 'a {
         let mut flip = Vec2::ONE;
@@ -52,7 +54,7 @@ impl ComputedTextureSlices {
 /// * `atlas_layouts` - The atlas layout assets, used to retrieve the texture atlas section rect
 #[must_use]
 fn compute_sprite_slices(
-    sprite: &Sprite,
+    sprite: &FireflySprite,
     images: &Assets<Image>,
     atlas_layouts: &Assets<TextureAtlasLayout>,
 ) -> Option<ComputedTextureSlices> {
@@ -78,8 +80,10 @@ fn compute_sprite_slices(
         }
     };
     let slices = match &sprite.image_mode {
-        SpriteImageMode::Sliced(slicer) => slicer.compute_slices(texture_rect, sprite.custom_size),
-        SpriteImageMode::Tiled {
+        FireflySpriteImageMode::Sliced(slicer) => {
+            slicer.compute_slices(texture_rect, sprite.custom_size)
+        }
+        FireflySpriteImageMode::Tiled {
             tile_x,
             tile_y,
             stretch_value,
@@ -91,7 +95,7 @@ fn compute_sprite_slices(
             };
             slice.tiled(*stretch_value, (*tile_x, *tile_y))
         }
-        SpriteImageMode::Instances(instances) => {
+        FireflySpriteImageMode::Instances(instances) => {
             let layout = atlas_layouts.get(&sprite.texture_atlas.as_ref()?.layout)?;
 
             instances
@@ -106,10 +110,10 @@ fn compute_sprite_slices(
                 })
                 .collect::<Option<Vec<TextureSlice>>>()?
         }
-        SpriteImageMode::Auto => {
+        FireflySpriteImageMode::Auto => {
             unreachable!("Slices should not be computed for SpriteImageMode::Stretch")
         }
-        SpriteImageMode::Scale(_) => {
+        FireflySpriteImageMode::Scale(_) => {
             unreachable!("Slices should not be computed for SpriteImageMode::Scale")
         }
     };
@@ -123,7 +127,7 @@ pub(crate) fn compute_slices_on_asset_event(
     mut events: MessageReader<AssetEvent<Image>>,
     images: Res<Assets<Image>>,
     atlas_layouts: Res<Assets<TextureAtlasLayout>>,
-    sprites: Query<(Entity, &Sprite)>,
+    sprites: Query<(Entity, &FireflySprite)>,
 ) {
     // We store the asset ids of added/modified image assets
     let added_handles: HashSet<_> = events
@@ -155,7 +159,7 @@ pub(crate) fn compute_slices_on_sprite_change(
     mut commands: Commands,
     images: Res<Assets<Image>>,
     atlas_layouts: Res<Assets<TextureAtlasLayout>>,
-    changed_sprites: Query<(Entity, &Sprite), Changed<Sprite>>,
+    changed_sprites: Query<(Entity, &FireflySprite), Changed<FireflySprite>>,
 ) {
     for (entity, sprite) in &changed_sprites {
         if !sprite.image_mode.uses_slices() {

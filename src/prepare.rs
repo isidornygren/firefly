@@ -14,8 +14,9 @@ use crate::{
         SpecializedApplicationPipeline, SpritePipeline,
     },
     sprites::{
-        ExtractedSlices, ExtractedSpriteKind, ExtractedSprites, ImageBindGroups, SpriteAssetEvents,
-        SpriteBatch, SpriteBatches, SpriteInstance, SpriteMeta, SpriteViewBindGroup,
+        ExtractedFireflySlices, ExtractedFireflySpriteKind, ExtractedFireflySprites,
+        ImageBindGroups, SpriteAssetEvents, SpriteBatch, SpriteBatches, SpriteInstance, SpriteMeta,
+        SpriteViewBindGroup,
     },
     utils::apply_scaling,
 };
@@ -605,8 +606,8 @@ fn prepare_sprite_image_bind_groups(
     sprite_pipeline: Res<SpritePipeline>,
     mut image_bind_groups: ResMut<ImageBindGroups>,
     gpu_images: Res<RenderAssets<GpuImage>>,
-    extracted_sprites: Res<ExtractedSprites>,
-    extracted_slices: Res<ExtractedSlices>,
+    extracted_sprites: Res<ExtractedFireflySprites>,
+    extracted_slices: Res<ExtractedFireflySlices>,
     mut phases: ResMut<ViewSortedRenderPhases<SpritePhase>>,
     events: Res<SpriteAssetEvents>,
     mut batches: ResMut<SpriteBatches>,
@@ -714,7 +715,7 @@ fn prepare_sprite_image_bind_groups(
                 ));
             }
             match extracted_sprite.kind {
-                ExtractedSpriteKind::Single {
+                ExtractedFireflySpriteKind::Single {
                     anchor,
                     rect,
                     scaling_mode,
@@ -789,7 +790,7 @@ fn prepare_sprite_image_bind_groups(
                     current_batch.as_mut().unwrap().get_mut().range.end += 1;
                     index += 1;
                 }
-                ExtractedSpriteKind::Slices { ref indices } => {
+                ExtractedFireflySpriteKind::Slices { ref indices } => {
                     for i in indices.clone() {
                         let slice = &extracted_slices.slices[i];
                         let rect = slice.rect;

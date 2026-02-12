@@ -104,6 +104,7 @@ pub mod nodes;
 pub mod phases;
 pub mod pipelines;
 pub mod prepare;
+pub mod sprite;
 pub mod sprites;
 
 mod utils;
@@ -115,6 +116,7 @@ pub mod prelude {
     pub use crate::data::{FireflyConfig, NormalMode};
     pub use crate::lights::{Falloff, LightHeight, PointLight2d};
     pub use crate::occluders::Occluder2d;
+    pub use crate::sprite::{FireflySprite, FireflySpriteImageMode, SpriteInstance};
     pub use crate::sprites::{NormalMap, SpriteHeight};
     pub use crate::{ApplyLightmapLabel, CreateLightmapLabel};
 }
