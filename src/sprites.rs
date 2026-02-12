@@ -81,11 +81,6 @@ pub(crate) struct ExtractedFireflySprites {
 }
 
 #[derive(Resource, Default)]
-pub(crate) struct ExtractedFireflySlices {
-    pub slices: Vec<ExtractedSlice>,
-}
-
-#[derive(Resource, Default)]
 pub(crate) struct SpriteAssetEvents {
     pub images: Vec<AssetEvent<Image>>,
 }
@@ -223,7 +218,6 @@ impl Plugin for SpritesPlugin {
                 .init_resource::<DrawFunctions<SpritePhase>>()
                 .init_resource::<SpriteMeta>()
                 .init_resource::<ExtractedFireflySprites>()
-                .init_resource::<ExtractedFireflySlices>()
                 .init_resource::<SpriteAssetEvents>()
                 .add_render_command::<SpritePhase, DrawSprite>()
                 .init_resource::<ViewSortedRenderPhases<SpritePhase>>()

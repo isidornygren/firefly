@@ -14,9 +14,8 @@ use crate::{
         SpecializedApplicationPipeline, SpritePipeline,
     },
     sprites::{
-        ExtractedFireflySlices, ExtractedFireflySpriteKind, ExtractedFireflySprites,
-        ImageBindGroups, SpriteAssetEvents, SpriteBatch, SpriteBatches, SpriteInstance, SpriteMeta,
-        SpriteViewBindGroup,
+        ExtractedFireflySpriteKind, ExtractedFireflySprites, ImageBindGroups, SpriteAssetEvents,
+        SpriteBatch, SpriteBatches, SpriteInstance, SpriteMeta, SpriteViewBindGroup,
     },
     utils::apply_scaling,
 };
@@ -40,6 +39,7 @@ use bevy::{
         texture::{FallbackImage, GpuImage, TextureCache},
         view::{ExtractedView, ViewTarget, ViewUniforms},
     },
+    sprite_render::ExtractedSlices,
     tasks::{ComputeTaskPool, ParallelSliceMut},
 };
 
@@ -607,7 +607,7 @@ fn prepare_sprite_image_bind_groups(
     mut image_bind_groups: ResMut<ImageBindGroups>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     extracted_sprites: Res<ExtractedFireflySprites>,
-    extracted_slices: Res<ExtractedFireflySlices>,
+    extracted_slices: Res<ExtractedSlices>,
     mut phases: ResMut<ViewSortedRenderPhases<SpritePhase>>,
     events: Res<SpriteAssetEvents>,
     mut batches: ResMut<SpriteBatches>,

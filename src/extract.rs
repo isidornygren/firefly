@@ -27,8 +27,8 @@ use crate::{
     prelude::Occluder2d,
     sprite::FireflySprite,
     sprites::{
-        ExtractedFireflySlices, ExtractedFireflySprite, ExtractedFireflySpriteKind,
-        ExtractedFireflySprites, NormalMap, SpriteAssetEvents, SpriteHeight,
+        ExtractedFireflySprite, ExtractedFireflySpriteKind, ExtractedFireflySprites, NormalMap,
+        SpriteAssetEvents, SpriteHeight,
     },
     visibility::{NotVisible, OccluderAabb, VisibilityTimer},
 };
@@ -105,7 +105,6 @@ fn extract_sprite_events(
 fn extract_sprites(
     mut extracted_firefly_sprites: ResMut<ExtractedFireflySprites>,
     mut extracted_sprites: ResMut<ExtractedSprites>,
-    mut extracted_firefly_slices: ResMut<ExtractedFireflySlices>,
     mut extracted_slices: ResMut<ExtractedSlices>,
     texture_atlases: Extract<Res<Assets<TextureAtlasLayout>>>,
     sprite_query: Extract<
@@ -123,7 +122,6 @@ fn extract_sprites(
     >,
 ) {
     extracted_firefly_sprites.sprites.clear();
-    extracted_firefly_slices.slices.clear();
     for (
         main_entity,
         render_entity,
@@ -143,14 +141,11 @@ fn extract_sprites(
         let height = height.map_or(0., |h| h.0);
 
         if let Some(slices) = slices {
-            let start = extracted_firefly_slices.slices.len();
-            extracted_firefly_slices
-                .slices
-                .extend(slices.extract_slices(sprite, anchor));
+            let start = extracted_slices.slices.len();
             extracted_slices
                 .slices
                 .extend(slices.extract_slices(sprite, anchor));
-            let end = extracted_firefly_slices.slices.len();
+            let end = extracted_slices.slices.len();
             extracted_firefly_sprites
                 .sprites
                 .push(ExtractedFireflySprite {
