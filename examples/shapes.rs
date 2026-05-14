@@ -1,15 +1,31 @@
-use bevy::{color::palettes::css::RED, prelude::*, render::view::Hdr, window::PrimaryWindow};
+use bevy::{
+    color::palettes::css::RED, input::mouse::MouseWheel, prelude::*, render::view::Hdr,
+    window::PrimaryWindow,
+};
 use bevy_firefly::prelude::*;
 
 // A simple example showcasing the different occluder shapes.
 // You can click around the screen to reposition the light.
 
-// This example also showcases hard (non-soft) shadows and light banding.
-
 fn main() {
     let mut app = App::new();
 
-    app.add_plugins((DefaultPlugins, FireflyPlugin, FireflyGizmosPlugin));
+    app.add_plugins((
+        DefaultPlugins
+            .set(AssetPlugin {
+                watch_for_changes_override: Some(true),
+                ..default()
+            })
+            .set(ImagePlugin::default_nearest()),
+        FireflyPlugin,
+        FireflyGizmosPlugin,
+    ));
+
+    app.insert_resource(FireflyGizmoStyle {
+        light_inner_color: Color::NONE,
+        ..default()
+    });
+
     app.add_systems(Startup, setup);
     app.add_systems(Update, (move_light, move_camera));
 
@@ -27,8 +43,6 @@ fn setup(mut commands: Commands) {
         Hdr,
         FireflyConfig {
             ambient_brightness: 0.3,
-            softness: None,
-            light_bands: Some(0.7),
             ..default()
         },
         Transform::from_translation(vec3(-230., 75., 0.)),
@@ -38,17 +52,33 @@ fn setup(mut commands: Commands) {
     commands.spawn((
         PointLight2d {
             color: Color::srgb(1.0, 0.5, 1.0),
-            intensity: 3.0,
-            range: 250.,
+            intensity: 10.0,
+            radius: 450.0,
+            core: LightCore {
+                radius: 30.0,
+                boost: 50.0,
+                ..default()
+            },
             ..default()
         },
-        Transform::default(),
+        Transform::from_translation(vec3(-150., 120.0, 0.0)),
     ));
 
-    // occluders
     commands.spawn((
-        Occluder2d::rectangle(22.0, 14.0),
-        Transform::from_translation(vec3(-322., 164., 0.)),
+        Occluder2d::polygon(vec![
+            vec2(0.0, 0.0),
+            vec2(0.0, 20.0),
+            vec2(20.0, 20.0),
+            vec2(20.0, 0.0),
+        ])
+        .unwrap(),
+        Transform::from_translation(vec3(-250., 164., 0.)),
+    ));
+
+    commands.spawn((
+        Occluder2d::capsule(30.0, 10.0),
+        Transform::from_translation(vec3(-420., 230., 0.))
+            .with_rotation(Quat::from_rotation_z(0.9)),
     ));
 
     commands.spawn((
@@ -63,15 +93,24 @@ fn setup(mut commands: Commands) {
 
     commands.spawn((
         Occluder2d::polygon(vec![
-            vec2(-255., 91.),
-            vec2(-237., 33.),
             vec2(-302., 6.),
             vec2(-358., 45.),
             vec2(-329., 81.),
             vec2(-289., 99.),
+            vec2(-255., 91.),
+            vec2(-237., 33.),
         ])
         .unwrap(),
         Transform::default(),
+    ));
+
+    commands.spawn((
+        Occluder2d::polygon(vec![vec2(50., 100.), vec2(47., 130.), vec2(55., 125.)]).unwrap(),
+        Transform::default(),
+    ));
+
+    commands.spawn((
+        Occluder2d::polygon(vec![vec2(55., 135.), vec2(47., 140.), vec2(55., 155.)]).unwrap(),
     ));
 
     commands.spawn((
@@ -80,23 +119,30 @@ fn setup(mut commands: Commands) {
             vec2(-58., 163.),
             vec2(-25., 105.),
             vec2(-109., 53.),
+            vec2(-97., 100.),
         ])
         .unwrap(),
         Transform::default(),
     ));
 
     commands.spawn((
-        Occluder2d::polygon(vec![
-            vec2(-358., 276.),
-            vec2(-342., 208.),
-            vec2(-429., 172.),
-            vec2(-428., 135.),
-            vec2(-482., 158.),
-            vec2(-475., 231.),
-            vec2(-438., 290.),
-            vec2(-388., 299.),
-            vec2(-380., 278.),
-        ])
+        Occluder2d::polygon(
+            vec![
+                vec2(-428., 135.),
+                vec2(-482., 158.),
+                vec2(-475., 231.),
+                vec2(-438., 290.),
+                vec2(-388., 299.),
+                vec2(-380., 278.),
+                vec2(-358., 276.),
+                vec2(-342., 208.),
+                vec2(-429., 172.),
+            ]
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>(),
+        )
         .unwrap(),
         Transform::default(),
     ));
@@ -158,15 +204,38 @@ fn setup(mut commands: Commands) {
         Occluder2d::rectangle(10., 10.),
         Transform::from_translation(vec3(-109., 210., 0.)),
     ));
+
+    let spline = CubicCardinalSpline::new_catmull_rom(vec![
+        vec2(0., 0.),
+        vec2(100., 0.),
+        vec2(120., 150.),
+        vec2(54., 120.),
+        vec2(0., 170.),
+    ])
+    .to_curve()
+    .unwrap();
+
+    let samples = 10 * spline.segments().len();
+
+    commands.spawn((
+        Occluder2d::polyline(spline.iter_positions(samples).collect::<Vec<_>>()).unwrap(),
+        Transform::from_translation(vec3(-510., -100., 0.)),
+    ));
 }
 
 fn move_light(
-    mut light: Single<&mut Transform, With<PointLight2d>>,
+    mut light: Single<(&mut Transform, &mut PointLight2d)>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform)>,
     buttons: Res<ButtonInput<MouseButton>>,
+    mut scroll: MessageReader<MouseWheel>,
     mut gizmos: Gizmos,
 ) {
+    for scroll_event in scroll.read() {
+        light.1.core.radius += scroll_event.y * 5.0;
+        light.1.core.radius = light.1.core.radius.max(0.0);
+    }
+
     if !buttons.pressed(MouseButton::Left) {
         return;
     }
@@ -180,25 +249,40 @@ fn move_light(
 
     gizmos.circle_2d(Isometry2d::from_translation(cursor_position), 5., RED);
 
-    light.translation = cursor_position.extend(0.);
+    light.0.translation = cursor_position.extend(0.);
 }
 
 const CAMERA_SPEED: f32 = 60.0;
 fn move_camera(
-    mut camera: Single<&mut Transform, With<FireflyConfig>>,
+    mut camera: Single<(&mut Transform, &mut FireflyConfig, &mut Projection)>,
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
 ) {
+    if keys.just_pressed(KeyCode::Space) {
+        camera.1.lightmap_filtering = !camera.1.lightmap_filtering;
+    }
+
     if keys.pressed(KeyCode::KeyA) {
-        camera.translation.x -= time.delta_secs() * CAMERA_SPEED;
+        camera.0.translation.x -= time.delta_secs() * CAMERA_SPEED;
     }
     if keys.pressed(KeyCode::KeyD) {
-        camera.translation.x += time.delta_secs() * CAMERA_SPEED;
+        camera.0.translation.x += time.delta_secs() * CAMERA_SPEED;
     }
     if keys.pressed(KeyCode::KeyS) {
-        camera.translation.y -= time.delta_secs() * CAMERA_SPEED;
+        camera.0.translation.y -= time.delta_secs() * CAMERA_SPEED;
     }
     if keys.pressed(KeyCode::KeyW) {
-        camera.translation.y += time.delta_secs() * CAMERA_SPEED;
+        camera.0.translation.y += time.delta_secs() * CAMERA_SPEED;
+    }
+
+    let Projection::Orthographic(ref mut projection) = *camera.2 else {
+        return;
+    };
+
+    if keys.pressed(KeyCode::ArrowLeft) {
+        projection.scale += time.delta_secs();
+    }
+    if keys.pressed(KeyCode::ArrowRight) {
+        projection.scale = (projection.scale - time.delta_secs()).max(0.01);
     }
 }

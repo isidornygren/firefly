@@ -31,7 +31,7 @@ pub struct NotVisible;
 
 impl Default for VisibilityTimer {
     fn default() -> Self {
-        Self(Timer::from_seconds(2.0, TimerMode::Once))
+        Self(Timer::from_seconds(0.1, TimerMode::Once))
     }
 }
 
@@ -75,23 +75,29 @@ fn mark_visible_lights(
         &mut ViewVisibility,
         &mut VisibilityTimer,
     )>,
-    mut camera: Single<(&GlobalTransform, &mut VisibleEntities, &Projection), With<FireflyConfig>>,
+    mut cameras: Query<(&GlobalTransform, &mut VisibleEntities, &Projection), With<FireflyConfig>>,
     mut light_rect: ResMut<LightRect>,
     time: Res<Time>,
 ) {
-    let Projection::Orthographic(projection) = camera.2 else {
-        return;
-    };
-
-    let camera_aabb = Aabb2d {
-        min: projection.area.min + camera.0.translation().truncate(),
-        max: projection.area.max + camera.0.translation().truncate(),
-    };
-
-    let camera_rect = Rect {
-        min: projection.area.min + camera.0.translation().truncate(),
-        max: projection.area.max + camera.0.translation().truncate(),
-    };
+    let mut camera_rects = cameras
+        .iter_mut()
+        .filter_map(|camera| {
+            let Projection::Orthographic(projection) = camera.2 else {
+                return None;
+            };
+            Some((
+                Aabb2d {
+                    min: projection.area.min + camera.0.translation().truncate(),
+                    max: projection.area.max + camera.0.translation().truncate(),
+                },
+                Rect {
+                    min: projection.area.min + camera.0.translation().truncate(),
+                    max: projection.area.max + camera.0.translation().truncate(),
+                },
+                camera.1,
+            ))
+        })
+        .collect::<Vec<_>>();
 
     light_rect.0 = Rect::EMPTY;
 
@@ -99,26 +105,27 @@ fn mark_visible_lights(
         let pos = transform.translation().truncate() - vec2(0.0, height.0) + light.offset.xy();
 
         let light_aabb = Aabb2d {
-            min: pos - light.range,
-            max: pos + light.range,
+            min: pos - light.radius,
+            max: pos + light.radius,
         };
 
-        if light_aabb.intersects(&camera_aabb) {
-            if !visibility.get() {
-                visibility.set_visible();
+        for (camera_aabb, camera_rect, visible_entities) in camera_rects.iter_mut() {
+            if light_aabb.intersects(camera_aabb) {
+                if !visibility.get() {
+                    visibility.set_visible();
+                    *visibility_timer = default();
+                }
 
-                let visible_lights = camera.1.get_mut(TypeId::of::<PointLight2d>());
+                let visible_lights = visible_entities.get_mut(TypeId::of::<PointLight2d>());
                 visible_lights.push(entity);
 
-                *visibility_timer = default();
+                light_rect.0 = light_rect
+                    .0
+                    .union(camera_rect.union_point(pos).intersect(Rect {
+                        min: pos - light.radius,
+                        max: pos + light.radius,
+                    }));
             }
-
-            light_rect.0 = light_rect
-                .0
-                .union(camera_rect.union_point(pos).intersect(Rect {
-                    min: pos - light.range,
-                    max: pos + light.range,
-                }));
         }
 
         visibility_timer.0.tick(time.delta());
@@ -126,13 +133,7 @@ fn mark_visible_lights(
 }
 
 fn mark_visible_occluders(
-    mut camera: Single<&mut VisibleEntities, With<FireflyConfig>>,
-    mut occluders: Query<(
-        Entity,
-        &OccluderAabb,
-        &mut ViewVisibility,
-        &mut VisibilityTimer,
-    )>,
+    mut occluders: Query<(&OccluderAabb, &mut ViewVisibility, &mut VisibilityTimer)>,
     light_rect: Res<LightRect>,
     time: Res<Time>,
 ) {
@@ -141,16 +142,14 @@ fn mark_visible_occluders(
         max: light_rect.0.max,
     };
 
-    for (entity, aabb, mut visibility, mut visibility_timer) in &mut occluders {
-        if aabb.0.intersects(&light_rect_aabb) {
-            if !visibility.get() {
-                visibility.set_visible();
+    for (aabb, mut visibility, mut visibility_timer) in &mut occluders {
+        if aabb.0.intersects(&light_rect_aabb) && !visibility.get() {
+            visibility.set_visible();
 
-                let visible_occluders = camera.get_mut(TypeId::of::<Occluder2d>());
-                visible_occluders.push(entity);
+            // let visible_occluders = camera.get_mut(TypeId::of::<Occluder2d>());
+            // visible_occluders.push(entity);
 
-                *visibility_timer = default();
-            }
+            *visibility_timer = default();
         }
 
         visibility_timer.0.tick(time.delta());
@@ -171,16 +170,18 @@ fn occluder_aabb(
 
         rect.0 = match occluder.shape() {
             Occluder2dShape::RoundRectangle {
-                width,
-                height,
+                half_width,
+                half_height,
                 radius,
             } => Aabb2d {
-                min: vec2(-width / 2.0, -height / 2.0) - radius,
-                max: vec2(width / 2.0, height / 2.0) + radius,
+                min: vec2(-half_width, -half_height) - radius,
+                max: vec2(*half_width, *half_height) + radius,
             }
             .transformed_by(isometry.translation, isometry.rotation),
 
-            Occluder2dShape::Polygon { vertices } => Aabb2d::from_point_cloud(isometry, vertices),
+            Occluder2dShape::Polygon { vertices, .. } => {
+                Aabb2d::from_point_cloud(isometry, vertices)
+            }
             Occluder2dShape::Polyline { vertices } => Aabb2d::from_point_cloud(isometry, vertices),
         }
     }

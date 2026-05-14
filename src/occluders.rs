@@ -1,7 +1,7 @@
 //! Module containing structs and functions relevant to Occluders.
 
 use bevy::{
-    camera::visibility::{VisibilityClass, add_visibility_class},
+    camera::visibility::{RenderLayers, VisibilityClass, add_visibility_class},
     color::palettes::css::BLACK,
     math::bounding::{Aabb2d, BoundingVolume},
     prelude::*,
@@ -21,7 +21,8 @@ use crate::{buffers::BufferIndex, change::Changes};
 /// Can be moved around or rotated by their transform.
 ///
 /// Only z-axis rotations are allowed, any other type of rotation can cause unexpected behavior and bugs.
-#[derive(Component, Clone, Reflect, Default)]
+#[derive(Debug, Component, Clone, Reflect, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[require(
     SyncToRenderWorld,
     Transform,
@@ -29,7 +30,8 @@ use crate::{buffers::BufferIndex, change::Changes};
     ViewVisibility,
     VisibilityTimer,
     OccluderAabb,
-    Changes
+    Changes,
+    RenderLayers
 )]
 #[component(on_add = add_visibility_class::<Occluder2d>)]
 pub struct Occluder2d {
@@ -108,13 +110,77 @@ impl Occluder2d {
     ///
     /// The points should be relative to the entity's translation.
     ///
-    /// # Failure
+    /// ## Vertex Ordering
+    /// This method will perform an extra `O(N)` check to determine if
+    /// the vertices are in clockwise or counter-clockwise order.
+    ///
+    /// If you wish to bypass this check, you can use the [`polygon_cc`](Occluder2d::polygon_cc)
+    /// and [`polygon_ccw`](Occluder2d::polygon_ccw) methods.
+    ///
+    /// ## Failure
     /// This returns None if the provided list doesn't contain at least 2 vertices.
-    pub fn polygon(vertices: Vec<Vec2>) -> Option<Self> {
-        normalize_vertices(vertices).and_then(|mut vertices| {
-            vertices.push(vertices[0]);
-            Some(Self::from_shape(Occluder2dShape::Polygon { vertices }))
-        })
+    pub fn polygon(vertices: impl Into<Vec<Vec2>>) -> Option<Self> {
+        let vertices = vertices.into();
+
+        if vertices.len() < 2 {
+            return None;
+        }
+
+        Some(Self::from_shape(Occluder2dShape::Polygon {
+            concave: is_concave(&vertices),
+            vertices: normalize_vertices(vertices),
+        }))
+    }
+
+    /// Construct a polygonal occluder from the given points.
+    ///
+    /// The points can form a convex or concave polygon. However,
+    /// having self-intersections can cause unexpected behavior.
+    ///
+    /// The points should be relative to the entity's translation.
+    ///
+    /// ## Vertex Ordering
+    /// Compared to [`polygon`](Occluder2d::polygon), this method assumed the vertices are in **clockwise** order.
+    ///
+    /// ## Failure
+    /// This returns None if the provided list doesn't contain at least 2 vertices.
+    pub fn polygon_cc(vertices: impl Into<Vec<Vec2>>) -> Option<Self> {
+        let vertices = vertices.into();
+
+        if vertices.len() < 2 {
+            return None;
+        }
+
+        Some(Self::from_shape(Occluder2dShape::Polygon {
+            concave: is_concave(&vertices),
+            vertices,
+        }))
+    }
+
+    /// Construct a polygonal occluder from the given points.
+    ///
+    /// The points can form a convex or concave polygon. However,
+    /// having self-intersections can cause unexpected behavior.
+    ///
+    /// The points should be relative to the entity's translation.
+    ///
+    /// ## Vertex Ordering
+    /// Compared to [`polygon`](Occluder2d::polygon), this method assumed the vertices are in **counter-clockwise** order.
+    ///
+    /// ## Failure
+    /// This returns None if the provided list doesn't contain at least 2 vertices.
+    pub fn polygon_ccw(vertices: impl Into<Vec<Vec2>>) -> Option<Self> {
+        let mut vertices = vertices.into();
+
+        if vertices.len() < 2 {
+            return None;
+        }
+        vertices.reverse();
+
+        Some(Self::from_shape(Occluder2dShape::Polygon {
+            concave: is_concave(&vertices),
+            vertices,
+        }))
     }
 
     /// Construct a polyline occluder from the given points.
@@ -125,13 +191,18 @@ impl Occluder2d {
     ///
     /// # Failure
     /// This returns None if the provided list doesn't contain at least 2 vertices.
-    pub fn polyline(mut vertices: Vec<Vec2>) -> Option<Self> {
-        let mut vertices_clone = vertices.clone();
-        vertices_clone.reverse();
-        vertices.extend_from_slice(&vertices_clone[1..vertices_clone.len()]);
+    pub fn polyline(vertices: impl Into<Vec<Vec2>>) -> Option<Self> {
+        let mut vertices = vertices.into();
 
-        normalize_vertices(vertices)
-            .and_then(|vertices| Some(Self::from_shape(Occluder2dShape::Polyline { vertices })))
+        if vertices.len() < 2 {
+            return None;
+        }
+
+        let mut vertices_clone = vertices.clone();
+
+        vertices_clone.reverse();
+        vertices.extend_from_slice(&vertices_clone[1..vertices_clone.len() - 1]);
+        Some(Self::from_shape(Occluder2dShape::Polyline { vertices }))
     }
 
     /// Construct a rectangle occluder from width and height.
@@ -147,8 +218,8 @@ impl Occluder2d {
     /// is a round rectangle with only height or only width (and radius).
     pub fn round_rectangle(width: f32, height: f32, radius: f32) -> Self {
         Self::from_shape(Occluder2dShape::RoundRectangle {
-            width,
-            height,
+            half_width: width * 0.5,
+            half_height: height * 0.5,
             radius,
         })
     }
@@ -187,6 +258,7 @@ pub struct ExtractedOccluder {
     pub opacity: f32,
     pub z_sorting: bool,
     pub changes: Changes,
+    pub render_layers: RenderLayers,
 }
 
 impl PartialEq for ExtractedOccluder {
@@ -208,42 +280,42 @@ impl ExtractedOccluder {
     }
 }
 
-// rotates vertices to be clockwise
-fn normalize_vertices(vertices: Vec<Vec2>) -> Option<Vec<Vec2>> {
-    if vertices.len() < 2 {
-        warn!("Not enough vertices to form shape");
-        return None;
+/// Rotates vertices to be clockwise.
+fn normalize_vertices(mut vertices: Vec<Vec2>) -> Vec<Vec2> {
+    let mut sum = 0.0;
+
+    for i in 0..vertices.len() {
+        let j = (i + 1) % vertices.len();
+        sum += (vertices[j].x - vertices[i].x) * (vertices[j].y + vertices[i].y);
     }
 
-    if vertices.len() < 3 {
-        return Some(vertices.to_vec());
+    if sum >= 0.0 {
+        vertices
+    } else {
+        vertices.reverse();
+        vertices
+    }
+}
+
+fn is_concave(vertices: &Vec<Vec2>) -> bool {
+    let n = vertices.len();
+    let mut first_orientation = orientation(vertices[0], vertices[1 % n], vertices[2 % n]);
+
+    for i in 1..n {
+        let new_orientation = orientation(
+            vertices[i % n],
+            vertices[(i + 1) % n],
+            vertices[(i + 2) % n],
+        );
+
+        if matches!(first_orientation, Orientation::Touch) {
+            first_orientation = new_orientation;
+        } else if first_orientation != new_orientation {
+            return false;
+        }
     }
 
-    let mut orientations: Vec<_> = vertices
-        .windows(3)
-        .map(|line| orientation(line[0], line[1], line[2]))
-        .collect();
-
-    orientations.push(orientation(
-        vertices[vertices.len() - 2],
-        vertices[vertices.len() - 1],
-        vertices[0],
-    ));
-    orientations.push(orientation(
-        vertices[vertices.len() - 1],
-        vertices[0],
-        vertices[1],
-    ));
-
-    if orientations.contains(&Orientation::Left) && orientations.contains(&Orientation::Right) {
-        return Some(vertices.to_vec());
-    }
-
-    if orientations.contains(&Orientation::Left) {
-        return Some(vertices.iter().rev().map(|x| *x).collect());
-    }
-
-    Some(vertices.to_vec())
+    true
 }
 
 #[derive(PartialEq, Eq)]
@@ -264,29 +336,46 @@ fn orientation(a: Vec2, b: Vec2, p: Vec2) -> Orientation {
     Orientation::Touch
 }
 
-pub(crate) fn point_inside_poly(p: Vec2, mut poly: Vec<Vec2>, aabb: Aabb2d) -> bool {
+pub(crate) fn point_inside_poly(p: Vec2, poly: &Vec<Vec2>, aabb: Aabb2d, concave: bool) -> bool {
     if !aabb.contains(&Aabb2d { min: p, max: p }) {
         return false;
     }
+    let n = poly.len();
 
-    poly.push(poly[0]);
+    if !concave {
+        let mut inside = false;
 
-    let mut inside = false;
+        for i in 0..n {
+            let line = [poly[i % n], poly[(i + 1) % n]];
 
-    for line in poly.windows(2) {
-        if p.y > line[0].y.min(line[1].y)
-            && p.y <= line[0].y.max(line[1].y)
-            && p.x <= line[0].x.max(line[1].x)
-        {
-            let x_intersection =
-                (p.y - line[0].y) * (line[1].x - line[0].x) / (line[1].y - line[0].y) + line[0].x;
+            if p.y > line[0].y.min(line[1].y)
+                && p.y <= line[0].y.max(line[1].y)
+                && p.x <= line[0].x.max(line[1].x)
+            {
+                let x_intersection = (p.y - line[0].y) * (line[1].x - line[0].x)
+                    / (line[1].y - line[0].y)
+                    + line[0].x;
 
-            if line[0].x == line[1].x || p.x <= x_intersection {
-                inside = !inside;
+                if line[0].x == line[1].x || p.x <= x_intersection {
+                    inside = !inside;
+                }
             }
         }
+        inside
+    } else {
+        for i in 0..n {
+            let ori = orientation(poly[i % n], poly[(i + 1) % n], p);
+            if matches!(ori, Orientation::Left) {
+                return false;
+            }
+
+            if matches!(ori, Orientation::Touch) {
+                return true;
+            }
+        }
+
+        true
     }
-    inside
 }
 
 /// Plugin that adds general main-world behavior relating to occluders. This is mainly responsible for
@@ -304,9 +393,8 @@ pub struct UniformOccluder {
     pub vertex_start: u32,
     pub n_vertices: u32,
     pub z: f32,
-    pub color: Vec3,
-    pub _pad0: f32,
     pub opacity: f32,
+    pub color: Vec4,
     pub z_sorting: u32,
     pub _pad1: [u32; 3],
 }
@@ -317,13 +405,12 @@ pub struct UniformOccluder {
 pub struct UniformRoundOccluder {
     pub pos: Vec2,
     pub rot: f32,
-    pub width: f32,
-    pub height: f32,
+    pub half_width: f32,
+    pub half_height: f32,
     pub radius: f32,
     pub z: f32,
-    pub color: Vec3,
-    pub _pad0: f32,
     pub opacity: f32,
+    pub color: Vec4,
     pub z_sorting: u32,
     pub _pad1: [u32; 3],
 }
@@ -337,17 +424,19 @@ pub(crate) struct UniformVertex {
 
 /// The internal shape of an [`Occluder`](crate::prelude::Occluder2d). This is intended to be generated automatically through
 /// the occluder's constructor methods and not added by hand.   
-#[derive(Reflect, Clone, Debug, PartialEq)]
+#[derive(Debug, Reflect, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Occluder2dShape {
     Polygon {
         vertices: Vec<Vec2>,
+        concave: bool,
     },
     Polyline {
         vertices: Vec<Vec2>,
     },
     RoundRectangle {
-        width: f32,
-        height: f32,
+        half_width: f32,
+        half_height: f32,
         radius: f32,
     },
 }
@@ -355,8 +444,8 @@ pub enum Occluder2dShape {
 impl Default for Occluder2dShape {
     fn default() -> Self {
         Self::RoundRectangle {
-            width: 10.,
-            height: 10.,
+            half_width: 5.,
+            half_height: 5.,
             radius: 0.,
         }
     }
@@ -365,7 +454,7 @@ impl Default for Occluder2dShape {
 impl Occluder2dShape {
     pub(crate) fn n_vertices(&self) -> u32 {
         match &self {
-            Self::Polygon { vertices } => vertices.len() as u32,
+            Self::Polygon { vertices, .. } => vertices.len() as u32,
             Self::Polyline { vertices } => vertices.len() as u32,
             Self::RoundRectangle { .. } => 0,
         }
@@ -385,16 +474,23 @@ impl Occluder2dShape {
     ) -> Option<Box<dyn 'a + DoubleEndedIterator<Item = Vec2>>> {
         match self {
             Self::Polygon { vertices, .. } => Some(translate_vertices_iter(
-                Box::new(vertices.iter().map(|v| *v)),
+                Box::new(vertices.iter().copied()),
                 pos,
                 rot,
             )),
             Self::Polyline { vertices, .. } => Some(translate_vertices_iter(
-                Box::new(vertices.iter().map(|v| *v)),
+                Box::new(vertices.iter().copied()),
                 pos,
                 rot,
             )),
             Self::RoundRectangle { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_concave(&self) -> bool {
+        match self {
+            Self::Polygon { concave, .. } => *concave,
+            _ => false,
         }
     }
 }

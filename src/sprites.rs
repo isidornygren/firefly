@@ -6,8 +6,9 @@
 
 use std::ops::Range;
 
+use crate::data::FireflyConfig;
 use crate::phases::SpritePhase;
-use crate::pipelines::SpritePipeline;
+use crate::pipelines::{SpritePipeline, SpritePipelineKey};
 use crate::sprite::FireflySprite;
 use crate::utils::{compute_slices_on_asset_event, compute_slices_on_sprite_change};
 
@@ -93,12 +94,13 @@ pub(crate) struct SpriteInstance {
     pub i_uv_offset_scale: [f32; 4],
     pub z: f32,
     pub height: f32,
-    pub _padding: [f32; 2],
+    pub y: f32,
+    pub _padding: f32,
 }
 
 impl SpriteInstance {
     #[inline]
-    pub fn from(transform: &Affine3A, uv_offset_scale: &Vec4, z: f32, height: f32) -> Self {
+    pub fn from(transform: &Affine3A, uv_offset_scale: &Vec4, z: f32, height: f32, y: f32) -> Self {
         let transpose_model_3x3 = transform.matrix3.transpose();
         Self {
             i_model_transpose: [
@@ -109,7 +111,8 @@ impl SpriteInstance {
             z,
             i_uv_offset_scale: uv_offset_scale.to_array(),
             height,
-            _padding: [0.0, 0.0],
+            y,
+            _padding: 0.0,
         }
     }
 }
@@ -157,12 +160,25 @@ pub(crate) struct ImageBindGroups {
 ///
 /// # Example
 ///
+/// Automatic image loading:
 /// ```
 /// commands.spawn((
 ///     Sprite::from_image(asset_server.load("some_sprite.png")),
 ///     NormalMap::from_file("some_sprite_normal.png"),
 /// ));
 /// ```
+///
+/// Manual image loading:
+///
+/// ```
+/// let image: Handle<Image> = asset_server.load_with_settings("some_sprite_normal.png", |x: &mut ImageLoaderSettings| x.is_srgb = false);
+///
+/// commands.spawn((
+///     Sprite::from_image(asset_server.load("some_sprite.png")),
+///     NormalMap::from_image(image),
+/// ));
+/// ```
+///  
 /// See [Sprite] for more information on using sprites.
 #[derive(Component)]
 pub struct NormalMap {
@@ -189,11 +205,23 @@ impl NormalMap {
     ///
     /// This image file needs to match the corresponding [Sprite] image 1:1.  
     ///
-    /// You can use [.handle()](NormalMap::handle) to get the resulting image handle.
+    /// You can use [`.handle()`](NormalMap::handle) to get the resulting image handle.
     pub fn from_file<'a>(path: impl Into<AssetPath<'a>>, asset_server: &AssetServer) -> Self {
         let image: Handle<Image> =
             asset_server.load_with_settings(path, |x: &mut ImageLoaderSettings| x.is_srgb = false);
 
+        Self { image }
+    }
+
+    /// Construct a new [NormalMap] from an image handle. It's important that this image is loaded without gamma correction:
+    ///
+    /// ```
+    /// let image: Handle<Image> = asset_server.load_with_settings(path, |x: &mut ImageLoaderSettings| x.is_srgb = false);
+    /// ```
+    ///
+    /// You can use the [`from_file`](NormalMap::from_file) constructor to handle this automatically for you, and later grab the handle
+    /// via the [`.handle()`](NormalMap::handle) method.
+    pub fn from_image(image: Handle<Image>) -> Self {
         Self { image }
     }
 }
@@ -251,6 +279,7 @@ fn queue_sprites(
     extracted_sprites: Res<ExtractedFireflySprites>,
     mut phases: ResMut<ViewSortedRenderPhases<SpritePhase>>,
     mut views: Query<(
+        &FireflyConfig,
         &RenderVisibleEntities,
         &ExtractedView,
         &Msaa,
@@ -260,7 +289,7 @@ fn queue_sprites(
 ) {
     let draw_function = draw_functions.read().id::<DrawSprite>();
 
-    for (visible_entities, view, msaa, tonemapping, dither) in &mut views {
+    for (config, visible_entities, view, msaa, tonemapping, dither) in &mut views {
         let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
@@ -291,6 +320,10 @@ fn queue_sprites(
             }
         }
 
+        if config.enable_32bit_stencils {
+            view_key |= SpritePipelineKey::ENABLED_32BIT_STENCIL;
+        }
+
         let pipeline = pipelines.specialize(&pipeline_cache, &pipeline, view_key);
 
         view_entities.clear();
@@ -314,8 +347,8 @@ fn queue_sprites(
 
             // Add the item to the render phase
             phase.add(SpritePhase {
-                draw_function: draw_function,
-                pipeline: pipeline,
+                draw_function,
+                pipeline,
                 entity: (
                     extracted_sprite.render_entity,
                     extracted_sprite.main_entity.into(),
@@ -373,18 +406,15 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetSpriteTextureBindGrou
             return RenderCommandResult::Skip;
         };
 
-        pass.set_bind_group(
-            I,
-            image_bind_groups
-                .values
-                .get(&(
-                    batch.image_handle_id,
-                    batch.normal_handle_id,
-                    batch.normal_dummy,
-                ))
-                .unwrap(),
-            &[],
-        );
+        let Some(bind_group) = image_bind_groups.values.get(&(
+            batch.image_handle_id,
+            batch.normal_handle_id,
+            batch.normal_dummy,
+        )) else {
+            return RenderCommandResult::Skip;
+        };
+
+        pass.set_bind_group(I, bind_group, &[]);
         RenderCommandResult::Success
     }
 }
@@ -407,18 +437,16 @@ impl<P: PhaseItem> RenderCommand<P> for DrawSpriteBatch {
             return RenderCommandResult::Skip;
         };
 
-        pass.set_index_buffer(
-            sprite_meta.sprite_index_buffer.buffer().unwrap().slice(..),
-            IndexFormat::Uint32,
-        );
-        pass.set_vertex_buffer(
-            0,
-            sprite_meta
-                .sprite_instance_buffer
-                .buffer()
-                .unwrap()
-                .slice(..),
-        );
+        let Some(index_buffer) = sprite_meta.sprite_index_buffer.buffer() else {
+            return RenderCommandResult::Skip;
+        };
+
+        let Some(instance_buffer) = sprite_meta.sprite_instance_buffer.buffer() else {
+            return RenderCommandResult::Skip;
+        };
+
+        pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint32);
+        pass.set_vertex_buffer(0, instance_buffer.slice(..));
         pass.draw_indexed(0..6, 0, batch.range.clone());
         RenderCommandResult::Success
     }

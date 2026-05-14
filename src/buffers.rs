@@ -7,9 +7,14 @@
 //! Vertices for Polygonal Occluders are stored in a global [`VertexBuffer`].
 
 use core::f32;
-use std::{collections::VecDeque, f32::consts::PI};
+use std::{
+    array,
+    collections::{BinaryHeap, VecDeque},
+    f32::consts::{PI, TAU},
+};
 
 use bevy::{
+    platform::collections::HashMap,
     prelude::*,
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
@@ -18,6 +23,7 @@ use bevy::{
             encase::private::WriteInto,
         },
         renderer::{RenderDevice, RenderQueue},
+        view::RetainedViewEntity,
     },
 };
 use bytemuck::{NoUninit, Pod, Zeroable};
@@ -47,6 +53,8 @@ impl Plugin for BuffersPlugin {
                 .in_set(RenderSystems::Prepare)
                 .before(crate::prepare::prepare_data),
         );
+
+        render_app.add_systems(Render, handle_not_visible_entities);
     }
 
     fn finish(&self, app: &mut App) {
@@ -64,8 +72,6 @@ impl Plugin for BuffersPlugin {
 fn spawn_observers(mut commands: Commands) {
     commands.spawn(Observer::new(on_occluder_removed));
     commands.spawn(Observer::new(on_light_removed));
-
-    commands.spawn(Observer::new(on_entity_not_visible));
 }
 
 // handles buffer when the light gets despawned or the component is removed
@@ -74,11 +80,11 @@ fn on_light_removed(
     mut lights: Query<&mut LightIndex>,
     mut light_manager: ResMut<BufferManager<UniformPointLight>>,
 ) {
-    if let Ok(mut index) = lights.get_mut(trigger.entity) {
-        if let Some(old_index) = index.0 {
-            light_manager.free_index(old_index);
-            index.0 = None;
-        }
+    if let Ok(mut index) = lights.get_mut(trigger.entity)
+        && let Some(old_index) = index.0
+    {
+        light_manager.free_index(old_index);
+        index.0 = None;
     }
 }
 
@@ -117,8 +123,7 @@ fn on_occluder_removed(
 }
 
 // handles buffer when entity is not visible anymore
-fn on_entity_not_visible(
-    trigger: On<Add, NotVisible>,
+fn handle_not_visible_entities(
     mut occluders: Query<
         (
             Entity,
@@ -128,14 +133,14 @@ fn on_entity_not_visible(
         ),
         With<NotVisible>,
     >,
-    mut lights: Query<(Entity, &mut LightIndex)>,
+    mut lights: Query<(Entity, &mut LightIndex), With<NotVisible>>,
     mut round_manager: ResMut<BufferManager<UniformRoundOccluder>>,
     mut poly_manager: ResMut<BufferManager<UniformOccluder>>,
     mut vertex_buffer: ResMut<VertexBuffer>,
     mut light_manager: ResMut<BufferManager<UniformPointLight>>,
     mut commands: Commands,
 ) {
-    if let Ok((id, occluder, mut round_index, mut poly_index)) = occluders.get_mut(trigger.entity) {
+    for (id, occluder, mut round_index, mut poly_index) in &mut occluders {
         if matches!(occluder.shape, Occluder2dShape::RoundRectangle { .. }) {
             if let Some(old_index) = round_index.0 {
                 round_manager.free_index(old_index);
@@ -154,7 +159,9 @@ fn on_entity_not_visible(
 
         commands.entity(id).remove::<ExtractedOccluder>();
         commands.entity(id).remove::<NotVisible>();
-    } else if let Ok((id, mut index)) = lights.get_mut(trigger.entity) {
+    }
+
+    for (id, mut index) in &mut lights {
         if let Some(old_index) = index.0 {
             light_manager.free_index(old_index);
             index.0 = None;
@@ -178,21 +185,31 @@ fn prepare_lights(
         let light = UniformPointLight {
             pos: light.pos,
             intensity: light.intensity,
-            range: light.range,
+            radius: light.radius,
             color: light.color.to_linear().to_vec4(),
             z: light.z,
-            inner_range: light.inner_range.min(light.range),
-            falloff: match light.falloff {
-                Falloff::InverseSquare => 0,
-                Falloff::Linear => 1,
+            core_radius: light.core.radius,
+            core_boost: light.core.boost,
+            core_falloff: match light.core.falloff {
+                Falloff::InverseSquare { .. } => 0,
+                Falloff::Linear { .. } => 1,
+                Falloff::None => 2,
             },
-            falloff_intensity: light.falloff_intensity,
-            angle: light.angle / 180. * PI,
+            core_falloff_intensity: light.core.falloff.intensity(),
+            falloff: match light.falloff {
+                Falloff::InverseSquare { .. } => 0,
+                Falloff::Linear { .. } => 1,
+                Falloff::None => 2,
+            },
+            falloff_intensity: light.falloff.intensity(),
+            inner_angle: light.angle.inner / 180. * PI,
+            outer_angle: light.angle.outer / 180. * PI,
             dir: light.dir,
             height: light.height,
         };
 
-        let new_index = light_manager.set_value(&light, index.0, changed);
+        let new_index =
+            light_manager.set_value(&light, index.0, changed, &render_device, &render_queue);
         index.0 = Some(new_index);
     }
 
@@ -214,23 +231,21 @@ fn prepare_occluders(
 ) {
     for (occluder, mut round_index, mut poly_index) in &mut occluders {
         let changed = occluder.changes.0;
-
         if let Occluder2dShape::RoundRectangle {
-            width,
-            height,
+            half_width,
+            half_height,
             radius,
         } = occluder.shape
         {
             let value = UniformRoundOccluder {
                 pos: occluder.pos,
                 rot: occluder.rot,
-                width,
-                height,
+                half_width,
+                half_height,
                 radius,
                 // padding: default(),
                 z: occluder.z,
-                color: occluder.color.to_linear().to_vec3(),
-                _pad0: 0.0,
+                color: occluder.color.to_linear().to_vec4(),
                 opacity: occluder.opacity,
                 z_sorting: match occluder.z_sorting {
                     true => 1,
@@ -242,7 +257,13 @@ fn prepare_occluders(
             // assert_eq!(std::mem::size_of::<UniformRoundOccluder>(), 64);
             // assert_eq!(std::mem::align_of::<UniformRoundOccluder>(), 16);
 
-            let new_index = round_manager.set_value(&value, round_index.0, changed);
+            let new_index = round_manager.set_value(
+                &value,
+                round_index.0,
+                changed,
+                &render_device,
+                &render_queue,
+            );
             round_index.0 = Some(new_index);
         } else {
             let vertex_index = vertex_buffer.write_vertices(
@@ -258,8 +279,7 @@ fn prepare_occluders(
                 vertex_start: vertex_index.index as u32,
                 n_vertices: occluder.shape.n_vertices(),
                 z: occluder.z,
-                color: occluder.color.to_linear().to_vec3(),
-                _pad0: 0.0,
+                color: occluder.color.to_linear().to_vec4(),
                 opacity: occluder.opacity,
                 z_sorting: match occluder.z_sorting {
                     true => 1,
@@ -268,7 +288,13 @@ fn prepare_occluders(
                 _pad1: [0, 0, 0],
             };
 
-            let new_index = poly_manager.set_value(&value, poly_index.occluder, changed);
+            let new_index = poly_manager.set_value(
+                &value,
+                poly_index.occluder,
+                changed,
+                &render_device,
+                &render_queue,
+            );
             poly_index.occluder = Some(new_index);
         }
     }
@@ -277,6 +303,9 @@ fn prepare_occluders(
     poly_manager.flush(&render_device, &render_queue);
     vertex_buffer.pass(&render_device, &render_queue);
 }
+
+/// The max number of elements that will be written in a single command by [`BufferManager`].
+const MAX_SINGLE_WRITE_LENGTH: usize = 64;
 
 /// This resource is a wrapper around [`RawBufferVec`] that reserves and distributes VRAM slots to
 /// a set of entities that are intended to be transferred to the GPU. It is currently used for Occluders and Lights.
@@ -343,6 +372,8 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
         value: &T,
         index: Option<BufferIndex>,
         changed: bool,
+        device: &RenderDevice,
+        queue: &RenderQueue,
     ) -> BufferIndex {
         if !changed
             && let Some(index) = index
@@ -368,8 +399,18 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
             self.buffer.set(index as u32, *value);
         }
 
-        self.write_min = self.write_min.min(index);
-        self.write_max = self.write_max.max(index);
+        let next_min = self.write_min.min(index);
+        let next_max = self.write_max.max(index);
+
+        if next_max - next_min > MAX_SINGLE_WRITE_LENGTH {
+            self.write(device, queue);
+
+            self.write_min = index;
+            self.write_max = index;
+        } else {
+            self.write_min = next_min;
+            self.write_max = next_max;
+        }
 
         BufferIndex {
             index,
@@ -377,8 +418,7 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
         }
     }
 
-    /// Flush the changes at the end of a render frame. This writes all changes to the GPU.
-    pub fn flush(&mut self, device: &RenderDevice, queue: &RenderQueue) {
+    fn write(&mut self, device: &RenderDevice, queue: &RenderQueue) {
         if self.write_min != usize::MAX {
             if self.write_max >= self.buffer.capacity() {
                 self.buffer.reserve(
@@ -388,7 +428,7 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
                 self.buffer.write_buffer(device, queue);
             } else {
                 self.buffer
-                    .write_buffer_range(queue, self.write_min as usize..self.write_max as usize + 1)
+                    .write_buffer_range(queue, self.write_min..(self.write_max + 1))
                     .expect("couldn't write to buffer");
             }
         }
@@ -401,11 +441,14 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
         //     self.buffer.capacity(),
         //     self.free_indices.len(),
         // );
+    }
+
+    /// Flush the changes at the end of a render frame. This writes all changes to the GPU.
+    pub fn flush(&mut self, device: &RenderDevice, queue: &RenderQueue) {
+        self.write(device, queue);
 
         // Refragmentation. Because of wasted space the buffer will empty itself and pass all-new data next frame. This can be optimized
-        if self.free_indices.len() > 500
-            && self.free_indices.len() > self.buffer.capacity() as usize / 2
-        {
+        if self.free_indices.len() > 500 && self.free_indices.len() > self.buffer.capacity() / 2 {
             let old_generation = self.current_generation;
             *self = Self::new(device, queue);
             self.current_generation = old_generation + 1;
@@ -433,166 +476,156 @@ impl<T: ShaderType + WriteInto + Default + NoUninit> BufferManager<T> {
 }
 
 /// The amount of bins that each [`Bins`] will have.
-pub const N_BINS: usize = 128;
+pub const N_BINS: usize = 256;
+pub const N_BINS_FLOAT: f32 = 256.0;
 
-/// The amount of occluder per bin.
-pub const N_OCCLUDERS: usize = 32;
+/// A component that each light has, containing the [BinBuffer]s for each camera view.
+#[derive(Component, Default)]
+pub struct BinBuffers(pub HashMap<RetainedViewEntity, BinBuffer>);
 
-/// A component that each light has, containing sets of bins of occluders for faster iteration.
+/// A struct containing sets of bins of occluders for faster iteration.
 /// This is the most important acceleration structure used by Firefly. It is used in a custom
 /// type of angular sweep with BVH-inspired elements.
-#[derive(Component)]
 pub struct BinBuffer {
-    buffer: RawBufferVec<[Bin; N_BINS]>,
-    // the number of bins for each bin interval,
-    // used in case not all occluders fit in a single set of bins
-    counts: [u32; N_BINS],
-    bin_counts: StorageBuffer<BinCounts>,
+    /// List of all Occluders that will be written to the GPU.
+    buffer: RawBufferVec<OccluderPointer>,
+    /// Indices describing where each bin starts, written to the GPU. The extra value at the end is the maximum index / length.  
+    bin_indices: StorageBuffer<BinIndices>,
+    /// Data stored on the CPU.
+    occluders: [BinaryHeap<OccluderPointer>; N_BINS],
+}
+
+/// Wrapper for the bin indices, so it can impl Default.
+#[repr(C)]
+#[derive(Pod, Zeroable, Clone, Copy, ShaderType)]
+pub struct BinIndices {
+    indices: [u32; N_BINS + 1],
+}
+
+impl Default for BinIndices {
+    fn default() -> Self {
+        BinIndices {
+            indices: [0; N_BINS + 1],
+        }
+    }
 }
 
 impl Default for BinBuffer {
     fn default() -> Self {
         Self {
-            buffer: RawBufferVec::<[Bin; N_BINS]>::new(BufferUsages::STORAGE),
-            counts: [0; N_BINS],
-            bin_counts: StorageBuffer::<BinCounts>::default(),
-        }
-    }
-}
-
-/// A bin containing occluders.
-#[repr(C)]
-#[derive(Zeroable, Pod, Clone, Copy, ShaderType)]
-pub struct Bin {
-    pub occluders: [OccluderPointer; N_OCCLUDERS],
-    pub n_occluders: u32,
-}
-
-impl Default for Bin {
-    fn default() -> Self {
-        Self {
-            occluders: [default(); N_OCCLUDERS],
-            n_occluders: 0,
-        }
-    }
-}
-
-#[derive(Clone, ShaderType)]
-pub struct BinCounts {
-    pub counts: [u32; N_BINS],
-}
-
-impl Default for BinCounts {
-    fn default() -> Self {
-        Self {
-            counts: [0; N_BINS],
+            buffer: RawBufferVec::<OccluderPointer>::new(BufferUsages::STORAGE),
+            bin_indices: StorageBuffer::<BinIndices>::default(),
+            occluders: array::from_fn(|_| default()),
         }
     }
 }
 
 impl BinBuffer {
-    const PI2: f32 = PI * 2.0;
-    const N_BINS: f32 = N_BINS as f32;
-
     /// Get the binding of the bins. It is guaranteed to exist.
     pub fn bin_binding(&self) -> BindingResource<'_> {
         self.buffer.binding().unwrap()
     }
 
-    /// Get the binding of the number of each bin. It is guaranteed to exist.
-    pub fn bin_count_binding(&self) -> BindingResource<'_> {
-        self.bin_counts.binding().unwrap()
+    /// Get the binding of the end index of each bin. It is guaranteed to exist.
+    pub fn bin_indices_binding(&self) -> BindingResource<'_> {
+        self.bin_indices.binding().unwrap()
     }
 
     /// Write this buffer's data to the GPU. This function also sorts the
     /// occluders by distance enabling early-stopping in GPU checks.
     pub fn write(&mut self, device: &RenderDevice, queue: &RenderQueue) {
-        let values = self.buffer.values_mut();
-        for bin in 0..N_BINS {
-            for index in 0..values.len() {
-                if values[index][bin].n_occluders == 0 {
-                    break;
-                }
+        let mut bin_indices = [0; N_BINS + 1];
 
-                values[index][bin]
-                    .occluders
-                    .sort_unstable_by(|a, b| a.distance.total_cmp(&b.distance));
+        let mut count = 1;
+
+        let values = self.buffer.values_mut();
+
+        for (index, bin) in self.occluders.iter_mut().enumerate() {
+            bin_indices[index] = count as u32;
+            count += bin.len();
+            // info!("{:?}", &bin.clone().into_sorted_vec());
+            // values.extend_from_slice(&bin.clone().into_sorted_vec());
+
+            loop {
+                let Some(x) = bin.pop() else { break };
+                values.push(x);
             }
         }
+        bin_indices[N_BINS] = count as u32;
 
         self.buffer.write_buffer(device, queue);
 
-        self.bin_counts.set(BinCounts {
-            counts: self.counts,
+        self.bin_indices.set(BinIndices {
+            indices: bin_indices,
         });
-        self.bin_counts.write_buffer(device, queue);
-    }
-
-    fn push_empty(&mut self) {
-        self.buffer.push([default(); N_BINS]);
+        self.bin_indices.write_buffer(device, queue);
     }
 
     /// Clear the buffer and add one empty set of bins.
     pub fn reset(&mut self) {
         self.buffer.clear();
-        self.counts = [0; N_BINS];
-        self.push_empty();
+        self.buffer.push(OccluderPointer::default());
+
+        for bin in self.occluders.iter_mut() {
+            bin.clear();
+        }
     }
 
-    /// Add an occluder to this buffer.
-    pub fn add_occluder(&mut self, occluder: OccluderPointer, min_angle: f32, max_angle: f32) {
-        let min_bin = (((min_angle + PI) / Self::PI2) * Self::N_BINS).floor() as i32;
-        let max_bin = (((max_angle + PI) / Self::PI2) * Self::N_BINS).floor() as i32;
+    // const SCALE: f32 = N_BINS_FLOAT / TAU;
+    /// Add an occluder to this buffer. Or a set of edges, in case of a polygonal occluder.
+    pub fn add_occluder(&mut self, data: &OccluderData) {
+        if data.angle.ceil() >= TAU {
+            self.add_to_bins(0, N_BINS - 1, data.pointer);
+            return;
+        }
 
-        let mut bin_index = min_bin;
+        // info!("init min angle: {}", edge.min_angle);
 
-        loop {
-            let values = self.buffer.values_mut();
+        let min_angle = if data.min_angle < -PI {
+            data.min_angle + TAU
+        } else {
+            data.min_angle
+        };
 
-            let index = if bin_index < 0 {
-                bin_index + N_BINS as i32
-            } else if bin_index >= N_BINS as i32 {
-                bin_index - N_BINS as i32
-            } else {
-                bin_index
-            } as usize;
+        let min_bin = (((min_angle + PI) / TAU) * N_BINS_FLOAT).floor() as usize;
+        let n_bins = ((data.angle / TAU) * N_BINS_FLOAT).ceil() as usize;
 
-            while self.counts[index] >= values.len() as u32 {
-                values.push([default(); N_BINS]);
-            }
+        // info!("min bin: {min_bin}, n_bins: {n_bins}");
 
-            let bin = &mut values[self.counts[index] as usize][index];
+        // self.add_to_bins(0, N_BINS - 1, edge.pointer);
+        if min_bin + n_bins >= N_BINS {
+            self.add_to_bins(min_bin, N_BINS - 1, data.pointer);
+            self.add_to_bins(0, min_bin + n_bins - N_BINS, data.pointer);
+        } else {
+            self.add_to_bins(min_bin, min_bin + n_bins, data.pointer);
+        }
+    }
 
-            bin.occluders[bin.n_occluders as usize] = occluder;
-            bin.n_occluders += 1;
-
-            // if bin.n_occluders > 1 {
-            //     info!(
-            //         "adding occluder of {min_angle} - {max_angle} to bin {bin_index} of {}. bin.n_occcluders: {}",
-            //         self.counts[bin_index], bin.n_occluders
-            //     );
-            // }
-
-            if bin.n_occluders == N_OCCLUDERS as u32 {
-                self.counts[index] += 1;
-            }
-
-            if bin_index == max_bin {
-                break;
-            }
-
-            bin_index += 1;
+    fn add_to_bins(&mut self, min_bin: usize, max_bin: usize, pointer: OccluderPointer) {
+        // info!("writing buffers {min_bin} to {max_bin}");
+        for index in min_bin..(max_bin + 1) {
+            self.occluders[index].push(pointer);
         }
     }
 }
 
+/// CPU struct describing an occluder or edge.
+#[derive(Clone)]
+pub struct OccluderData {
+    pub pointer: OccluderPointer,
+    pub min_angle: f32,
+    pub angle: f32,
+}
+
 /// Compact struct pointing to a round occluder, or a chain of vertices from a polygonal occluder.  
 #[repr(C)]
-#[derive(Pod, Zeroable, Clone, Copy, ShaderType)]
+#[derive(Default, Pod, Zeroable, Clone, Copy, ShaderType, Debug)]
 pub struct OccluderPointer {
     /// The index's first bit is the type of occluder: 0 for round, 1 for polygonal.
+    pub index: u32,
+    /// The index of the first vertex of the path in the global vertex buffer, in case the occluder is polygonal.
     ///
-    /// In the case of polygonal occluders, there is additional data positioned on the consecutive bits:
+    /// There is also additional information encoded at the left of this value:
     ///
     /// - A `term` variable that takes 2 bits, describing the terminator format of this chain. This is 1
     /// if the chain ends looping over the atan2 seam, 2 if it starts like that, and 0 otherwise.
@@ -600,25 +633,34 @@ pub struct OccluderPointer {
     /// - A `rev` variable that takes 1 bit and specifies if the chain is made of vertices in the same order as they're
     /// stored in (clockwise) or not. This is used for when a light is inside the perimeter of an occluder and the
     /// edges need to be reversed.
-    pub index: u32,
-    /// Only used for polygonal occluders, the index of the first vertex of the chain in the global vertex buffer.
     pub min_v: u32,
-    /// Only used for polygonal occluders, the length of the vertex chain.
+    /// In case this edge loops over the atan2 seam, this will dicate the length after which that happens.
+    pub split: u32,
+    /// The length of the vertex edge, in case the occluder is polygonal.
     pub length: u32,
     /// The minimum distance from the occluder to the light source. This is used to accelerate GPU computations,
     /// because a point can't be blocked by this occluder if it's distance is greater than the point's own
-    /// distance to the light soruce.
+    /// distance to the light source.
     pub distance: f32,
 }
 
-impl Default for OccluderPointer {
-    fn default() -> Self {
-        Self {
-            index: 0,
-            min_v: 0,
-            length: 0,
-            distance: f32::MAX,
-        }
+impl PartialEq for OccluderPointer {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+
+impl Eq for OccluderPointer {}
+
+impl PartialOrd for OccluderPointer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        (-self.distance).partial_cmp(&-other.distance)
+    }
+}
+
+impl Ord for OccluderPointer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (-self.distance).total_cmp(&-other.distance)
     }
 }
 
@@ -702,7 +744,13 @@ impl VertexBuffer {
         if index < self.next_index {
             let mut last_index = index;
             for vertex in occluder.vertices_iter() {
-                self.vertices.set(last_index as u32, vertex);
+                if last_index >= self.vertices.len() {
+                    self.vertices.push(vertex);
+                    warn!("hmm.. what?");
+                } else {
+                    self.vertices.set(last_index as u32, vertex);
+                }
+
                 last_index += 1;
             }
 

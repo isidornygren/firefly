@@ -1,5 +1,5 @@
 use bevy::{
-    camera::visibility::{VisibilityClass, add_visibility_class},
+    camera::visibility::{RenderLayers, VisibilityClass, add_visibility_class},
     color::palettes::css::WHITE,
     core_pipeline::tonemapping::{DebandDither, Tonemapping},
     ecs::{
@@ -31,15 +31,17 @@ use bytemuck::NoUninit;
 
 use crate::{
     LightBatchSetKey,
-    buffers::{BinBuffer, BufferIndex},
+    buffers::{BinBuffers, BufferIndex},
     change::Changes,
+    data::ExtractedCombineLightmapTo,
     phases::LightmapPhase,
     pipelines::{LightPipelineKey, LightmapCreationPipeline},
     visibility::VisibilityTimer,
 };
 
 /// Point light with adjustable fields.
-#[derive(Component, Clone, Reflect)]
+#[derive(Debug, Component, Clone, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[require(
     SyncToRenderWorld,
     Transform,
@@ -47,7 +49,8 @@ use crate::{
     ViewVisibility,
     VisibilityTimer,
     LightHeight,
-    Changes
+    Changes,
+    RenderLayers
 )]
 #[component(on_add = add_visibility_class::<PointLight2d>)]
 pub struct PointLight2d {
@@ -62,34 +65,27 @@ pub struct PointLight2d {
     pub intensity: f32,
 
     /// Outer range of the point light.
-    pub range: f32,
-
-    /// Inner range of the point light. Should be less than the normal range.
-    ///
-    /// The light will have no falloff (full intensity) within this range.
-    ///
-    /// **Default:** 0.
-    pub inner_range: f32,
+    pub radius: f32,
 
     /// Type of falloff for this light.
     ///
     /// **Default:** [InverseSquare](Falloff::InverseSquare).
     pub falloff: Falloff,
 
-    /// The intensity of this light's falloff effect.
+    /// The core of the light.
     ///
-    /// **Default:** 1.
-    pub falloff_intensity: f32,
+    /// This is the inner section of the light that is usually brighter.
+    ///
+    /// The soft shadows are cast based on the radius of the core.
+    pub core: LightCore,
 
-    /// Angle in degrees of the point light. Between 0 and 360.
+    /// Optional parameter to constrain the angle of a light.
     ///
-    /// 0 - No light;
-    /// 360 - Full light going in all direction.
+    /// The direction of the angle is based on the **UP** direction of the entity.
+    /// Can be moved by rotating the entity.  
     ///
-    /// Relative to the direction the entity's facing.
-    ///
-    /// **Default:** 360.
-    pub angle: f32,
+    /// **Default:** LightAngle::FULL.
+    pub angle: LightAngle,
 
     /// Whether this light should cast shadows or not with the existent occluders.
     ///
@@ -107,6 +103,21 @@ pub struct PointLight2d {
     pub offset: Vec3,
 }
 
+impl Default for PointLight2d {
+    fn default() -> Self {
+        Self {
+            color: bevy::prelude::Color::Srgba(WHITE),
+            intensity: 1.,
+            radius: 100.,
+            falloff: Falloff::InverseSquare { intensity: 0.0 },
+            core: default(),
+            angle: LightAngle::FULL,
+            cast_shadows: true,
+            offset: Vec3::ZERO,
+        }
+    }
+}
+
 /// Optional component you can add to lights.
 ///
 /// Describes the light's 2d height, useful for emulating 3d lighting in top-down 2d games.
@@ -117,55 +128,158 @@ pub struct PointLight2d {
 #[derive(Component, Default, Reflect)]
 pub struct LightHeight(pub f32);
 
-/// An enum for the falloff type of a light.
-///
-/// **Default:** [InverseSquare](Falloff::InverseSquare).  
-#[derive(Clone, Copy, Reflect)]
-pub enum Falloff {
-    /// The intensity decreases inversely proportial to the square distance towards the inner light source.  
-    InverseSquare,
-    /// The intensity decreases linearly with the distance towards the inner light source.
-    Linear,
+#[derive(Debug, Clone, Copy, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// The angle of the light. Value is interpolated between inner and outer angles to create a smooth transition.
+pub struct LightAngle {
+    /// The inner angle of a light, in degrees. Should be less than or equial to the outer angle.
+    pub inner: f32,
+    /// The outer angle of a light, in degrees. Should be greater than or equal to the inner angle.
+    pub outer: f32,
 }
 
-impl Default for PointLight2d {
+impl Default for LightAngle {
     fn default() -> Self {
-        Self {
-            color: bevy::prelude::Color::Srgba(WHITE),
-            intensity: 1.,
-            range: 100.,
-            inner_range: 0.,
-            falloff: Falloff::InverseSquare,
-            falloff_intensity: 0.0,
-            angle: 360.0,
-            cast_shadows: true,
-            offset: Vec3::ZERO,
+        Self::FULL
+    }
+}
+
+impl LightAngle {
+    pub const FULL: Self = Self {
+        inner: 360.0,
+        outer: 360.0,
+    };
+}
+
+/// An enum describing the falloff of a light's intensity.
+#[derive(Debug, Clone, Copy, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Falloff {
+    /// The light decreases inversely proportial to the square distance towards the source.  
+    ///
+    /// The intensity parameter will increase the speed at which the light fades. Can be negative or positive.
+    InverseSquare { intensity: f32 },
+    /// The light decreases linearly with the distance towards the source.
+    ///
+    /// The intensity parameter will increase the speed at which the light fades. Can be negative or positive.
+    Linear { intensity: f32 },
+    /// There is no falloff. The light will have a constant intensity.  
+    None,
+}
+
+impl Falloff {
+    pub const INVERSE_SQUARE: Self = Self::InverseSquare { intensity: 0.0 };
+    pub const LINEAR: Self = Self::Linear { intensity: 0.0 };
+    pub const NONE: Self = Self::None;
+
+    pub fn inverse_square(intensity: f32) -> Falloff {
+        Falloff::InverseSquare { intensity }
+    }
+
+    pub fn linear(intensity: f32) -> Falloff {
+        Falloff::Linear { intensity }
+    }
+
+    pub fn none() -> Falloff {
+        Falloff::None
+    }
+
+    pub fn intensity(&self) -> f32 {
+        match *self {
+            Falloff::InverseSquare { intensity } => intensity,
+            Falloff::Linear { intensity } => intensity,
+            Falloff::None => 0.0,
         }
+    }
+}
+
+/// The light's core. This is what determines the softness of shadows if [soft_shadows](crate::prelude::FireflyConfig::soft_shadows) is enabled.
+#[derive(Clone, Copy, Debug, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LightCore {
+    /// The radius of the core. This must be less than the actual radius of the light.
+    ///
+    /// **Default:** 5.0.
+    pub radius: f32,
+    /// A boost to the core's intensity.
+    ///
+    /// If set to 0, the core will have a constant intensity equal to that of the light.
+    ///
+    /// Otherwise, the core will interpolate between `intensity + boost` and `intensity` based on the provided [`Falloff`].
+    ///
+    /// **Default:** 5.0.
+    pub boost: f32,
+    /// The core's falloff.
+    ///
+    ///  **Default:** InverseSquare { intensity: 0.0 }
+    pub falloff: Falloff,
+}
+
+impl Default for LightCore {
+    fn default() -> Self {
+        LightCore {
+            radius: 5.0,
+            boost: 0.0,
+            falloff: Falloff::InverseSquare { intensity: 0.0 },
+        }
+    }
+}
+
+impl LightCore {
+    pub const NONE: Self = LightCore {
+        radius: 0.0,
+        boost: 0.0,
+        falloff: Falloff::None,
+    };
+
+    pub fn from_radius_boost(radius: f32, boost: f32) -> LightCore {
+        LightCore {
+            radius,
+            boost,
+            falloff: Falloff::InverseSquare { intensity: 0.0 },
+        }
+    }
+    pub fn from_radius(radius: f32) -> LightCore {
+        LightCore {
+            radius,
+            boost: 5.0,
+            falloff: Falloff::InverseSquare { intensity: 0.0 },
+        }
+    }
+    pub fn with_boost(&self, boost: f32) -> LightCore {
+        let mut res = *self;
+        res.boost = boost;
+        res
+    }
+    pub fn with_falloff(&self, falloff: Falloff) -> LightCore {
+        let mut res = *self;
+        res.falloff = falloff;
+        res
     }
 }
 
 /// The data that is extracted to the render world from a [`PointLight2d`].
 #[derive(Component, Clone)]
-#[require(BinBuffer, LightIndex, LightPointer)]
+#[require(BinBuffers, LightIndex, LightPointer)]
 pub struct ExtractedPointLight {
     pub pos: Vec2,
     pub color: Color,
     pub intensity: f32,
-    pub range: f32,
-    pub inner_range: f32,
+    pub radius: f32,
     pub falloff: Falloff,
-    pub falloff_intensity: f32,
-    pub angle: f32,
+    pub core: LightCore,
+    pub angle: LightAngle,
     pub cast_shadows: bool,
     pub dir: Vec2,
     pub z: f32,
     pub height: f32,
     pub changes: Changes,
+    pub render_layers: RenderLayers,
 }
 
 impl PartialEq for ExtractedPointLight {
     fn eq(&self, other: &Self) -> bool {
-        self.pos == other.pos && self.range == other.range
+        self.pos == other.pos && self.radius == other.radius
     }
 }
 
@@ -175,13 +289,20 @@ impl PartialEq for ExtractedPointLight {
 pub struct UniformPointLight {
     pub pos: Vec2,
     pub intensity: f32,
-    pub range: f32,
+    pub radius: f32,
 
     pub color: Vec4,
-    pub inner_range: f32,
+
+    pub core_radius: f32,
+    pub core_boost: f32,
+    pub core_falloff: u32,
+    pub core_falloff_intensity: f32,
+
     pub falloff: u32,
     pub falloff_intensity: f32,
-    pub angle: f32,
+
+    pub inner_angle: f32,
+    pub outer_angle: f32,
 
     pub dir: Vec2,
 
@@ -231,7 +352,7 @@ pub(crate) struct LightBatch {
 
 #[derive(Resource, Default)]
 pub(crate) struct LightBindGroups {
-    pub values: HashMap<Entity, BindGroup>,
+    pub values: HashMap<Entity, HashMap<RetainedViewEntity, BindGroup>>,
 }
 
 #[derive(Component)]
@@ -248,20 +369,28 @@ fn queue_lights(
         &Msaa,
         Option<&Tonemapping>,
         Option<&DebandDither>,
+        Option<&ExtractedCombineLightmapTo>,
     )>,
     pipeline_cache: Res<PipelineCache>,
 ) {
     let draw_lightmap_function = light_draw_functions.read().id::<DrawLightmap>();
 
-    for (view, visible_entities, msaa, tonemapping, dither) in &views {
+    for (view, visible_entities, msaa, tonemapping, dither, combined_lightmap) in &views {
         let Some(lightmap_phase) = lightmap_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
 
-        let msaa_key = LightPipelineKey::from_msaa_samples(msaa.samples());
-        let mut view_key = LightPipelineKey::from_hdr(view.hdr) | msaa_key;
+        let (hdr, msaa) = if let Some(combined_lightmap) = combined_lightmap {
+            let view = views.get(combined_lightmap.0).unwrap();
+            (view.0.hdr, view.2)
+        } else {
+            (view.hdr, msaa)
+        };
 
-        if !view.hdr {
+        let msaa_key = LightPipelineKey::from_msaa_samples(msaa.samples());
+        let mut view_key = LightPipelineKey::from_hdr(hdr) | msaa_key;
+
+        if !hdr {
             if let Some(tonemapping) = tonemapping {
                 view_key |= LightPipelineKey::TONEMAP_IN_SHADER;
                 view_key |= match tonemapping {
@@ -288,7 +417,7 @@ fn queue_lights(
 
         for (render_entity, visible_entity) in visible_entities.iter::<PointLight2d>() {
             let batch_set_key = LightBatchSetKey {
-                pipeline: pipeline,
+                pipeline,
                 draw_function: draw_lightmap_function,
             };
 
@@ -325,7 +454,16 @@ impl<P: PhaseItem> RenderCommand<P> for SetLightTextureBindGroup {
         };
 
         pass.set_bind_group(0, &lut.0, &[view_uniform_offset.offset]);
-        pass.set_bind_group(1, image_bind_groups.values.get(&batch.id).unwrap(), &[]);
+        pass.set_bind_group(
+            1,
+            image_bind_groups
+                .values
+                .get(&batch.id)
+                .unwrap()
+                .get(&view.retained_view_entity)
+                .unwrap(),
+            &[],
+        );
 
         RenderCommandResult::Success
     }

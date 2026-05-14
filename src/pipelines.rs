@@ -12,21 +12,22 @@ use bevy::{
         render_resource::{
             BindGroupLayoutDescriptor, BindGroupLayoutEntries, BlendComponent, BlendFactor,
             BlendOperation, BlendState, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-            FragmentState, FrontFace, MultisampleState, PolygonMode, PrimitiveState,
+            FilterMode, FragmentState, FrontFace, MultisampleState, PolygonMode, PrimitiveState,
             RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
             SpecializedRenderPipeline, SpecializedRenderPipelines, TextureFormat,
             TextureSampleType, VertexAttribute, VertexState, VertexStepMode,
-            binding_types::{sampler, storage_buffer_read_only, texture_2d, uniform_buffer},
+            binding_types::{
+                sampler, storage_buffer_read_only, texture_2d, texture_2d_array, uniform_buffer,
+            },
         },
         renderer::RenderDevice,
         view::{ViewTarget, ViewUniform},
     },
     shader::{ShaderDefVal, load_shader_library},
-    sprite_render::SpritePipelineKey,
 };
 
 use crate::{
-    buffers::{Bin, BinCounts, N_BINS},
+    buffers::{BinIndices, OccluderPointer},
     data::UniformFireflyConfig,
     lights::UniformPointLight,
     occluders::{UniformOccluder, UniformRoundOccluder},
@@ -37,12 +38,13 @@ pub struct PipelinePlugin;
 
 impl Plugin for PipelinePlugin {
     fn build(&self, app: &mut App) {
-        load_shader_library!(app, "../shaders/types.wgsl");
-        load_shader_library!(app, "../shaders/utils.wgsl");
+        load_shader_library!(app, "shaders/types.wgsl");
+        load_shader_library!(app, "shaders/utils.wgsl");
 
-        embedded_asset!(app, "../shaders/create_lightmap.wgsl");
-        embedded_asset!(app, "../shaders/apply_lightmap.wgsl");
-        embedded_asset!(app, "../shaders/sprite.wgsl");
+        embedded_asset!(app, "shaders/create_lightmap.wgsl");
+        embedded_asset!(app, "shaders/apply_lightmap.wgsl");
+        embedded_asset!(app, "shaders/combine_lightmaps.wgsl");
+        embedded_asset!(app, "shaders/sprite.wgsl");
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -51,6 +53,7 @@ impl Plugin for PipelinePlugin {
         render_app
             .init_resource::<SpecializedRenderPipelines<LightmapCreationPipeline>>()
             .init_resource::<SpecializedRenderPipelines<LightmapApplicationPipeline>>()
+            .init_resource::<SpecializedRenderPipelines<LightmapCombinationPipeline>>()
             .init_resource::<SpecializedRenderPipelines<SpritePipeline>>();
 
         render_app.add_systems(
@@ -58,6 +61,7 @@ impl Plugin for PipelinePlugin {
             (
                 init_lightmap_creation_pipeline,
                 init_lightmap_application_pipeline,
+                init_lightmap_combination_pipeline,
                 init_sprite_pipeline,
             ),
         );
@@ -96,16 +100,16 @@ fn init_lightmap_creation_pipeline(
                 (4, storage_buffer_read_only::<UniformOccluder>(false)),
                 // vertices
                 (5, storage_buffer_read_only::<Vec2>(false)),
+                // occluders
+                (6, storage_buffer_read_only::<OccluderPointer>(false)),
                 // bins
-                (6, storage_buffer_read_only::<[Bin; N_BINS]>(false)),
-                (7, storage_buffer_read_only::<BinCounts>(false)),
+                (7, storage_buffer_read_only::<BinIndices>(false)),
                 // sprite stencil
                 (8, texture_2d(TextureSampleType::Float { filterable: true })),
                 // sprite normal map
                 (9, texture_2d(TextureSampleType::Float { filterable: true })),
                 // config,
                 (10, uniform_buffer::<UniformFireflyConfig>(false)),
-                // bins,
             ),
         ),
     );
@@ -137,7 +141,7 @@ fn init_lightmap_creation_pipeline(
         lut_layout,
         sampler,
         vertex_state,
-        shader: load_embedded_asset!(asset_server.as_ref(), "../shaders/create_lightmap.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "shaders/create_lightmap.wgsl"),
     });
 }
 
@@ -161,12 +165,14 @@ bitflags::bitflags! {
         const TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM = 5 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const COMBINE_LIGHTMAPS                 = 1 << 31;
+        const LIGHTMAP_FILTERING                = 1 << 30;
     }
 }
 
 impl LightPipelineKey {
     const MSAA_MASK_BITS: u32 = 0b111;
-    const MSAA_SHIFT_BITS: u32 = 32 - Self::MSAA_MASK_BITS.count_ones();
+    const MSAA_SHIFT_BITS: u32 = 16 - Self::MSAA_MASK_BITS.count_ones();
     const TONEMAP_METHOD_MASK_BITS: u32 = 0b111;
     const TONEMAP_METHOD_SHIFT_BITS: u32 =
         Self::MSAA_SHIFT_BITS - Self::TONEMAP_METHOD_MASK_BITS.count_ones();
@@ -251,8 +257,8 @@ impl SpecializedRenderPipeline for LightmapCreationPipeline {
                     format,
                     blend: Some(BlendState {
                         color: BlendComponent {
-                            src_factor: BlendFactor::Src,
-                            dst_factor: BlendFactor::Dst,
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::One,
                             operation: BlendOperation::Max,
                         },
                         alpha: BlendComponent::REPLACE,
@@ -265,7 +271,10 @@ impl SpecializedRenderPipeline for LightmapCreationPipeline {
             push_constant_ranges: default(),
             primitive: default(),
             depth_stencil: default(),
-            multisample: default(),
+            multisample: MultisampleState {
+                count: 1,
+                ..default()
+            },
             zero_initialize_workgroup_memory: default(),
         }
     }
@@ -275,13 +284,42 @@ impl SpecializedRenderPipeline for LightmapCreationPipeline {
 #[derive(Resource)]
 pub struct LightmapApplicationPipeline {
     pub layout: BindGroupLayoutDescriptor,
-    pub sampler: Sampler,
+    pub filtering_sampler: Sampler,
+    pub non_filtering_sampler: Sampler,
     pub vertex_state: VertexState,
     pub shader: Handle<Shader>,
 }
 
+impl LightmapApplicationPipeline {
+    pub(crate) fn specialize_layout(
+        &self,
+        combined: bool,
+        filter_lightmap: bool,
+    ) -> BindGroupLayoutDescriptor {
+        let mut layout = self.layout.clone();
+
+        if !filter_lightmap {
+            layout.entries[3] =
+                sampler(SamplerBindingType::NonFiltering).build(3, ShaderStages::FRAGMENT);
+        }
+
+        if combined {
+            layout.entries.push(
+                texture_2d_array(TextureSampleType::Float { filterable: true })
+                    .build(5, ShaderStages::FRAGMENT),
+            );
+        }
+
+        layout
+    }
+}
+
 #[derive(Component)]
-pub struct SpecializedApplicationPipeline(pub CachedRenderPipelineId);
+pub struct SpecializedApplicationPipeline {
+    pub id: CachedRenderPipelineId,
+    pub is_combined: bool,
+    pub filter_lightmap: bool,
+}
 
 fn init_lightmap_application_pipeline(
     mut commands: Commands,
@@ -290,26 +328,46 @@ fn init_lightmap_application_pipeline(
     asset_server: Res<AssetServer>,
 ) {
     let layout = BindGroupLayoutDescriptor::new(
-        "apply lightmap layout",
+        "apply lightmap layout simple",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
             (
+                // screen texture
                 texture_2d(TextureSampleType::Float { filterable: true }),
+                // lightmap texture
                 texture_2d(TextureSampleType::Float { filterable: true }),
+                // screen filter
                 sampler(SamplerBindingType::Filtering),
+                // lightmap filter
+                sampler(SamplerBindingType::Filtering),
+                // config
                 uniform_buffer::<UniformFireflyConfig>(false),
             ),
         ),
     );
 
-    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
+    let filtering_sampler = render_device.create_sampler(&SamplerDescriptor {
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        mipmap_filter: FilterMode::Linear,
+        ..default()
+    });
+
+    let non_filtering_sampler = render_device.create_sampler(&SamplerDescriptor {
+        mag_filter: FilterMode::Nearest,
+        min_filter: FilterMode::Nearest,
+        mipmap_filter: FilterMode::Nearest,
+        ..default()
+    });
+
     let vertex_state = fullscreen_shader.to_vertex_state();
 
     commands.insert_resource(LightmapApplicationPipeline {
         layout,
-        sampler,
+        filtering_sampler,
+        non_filtering_sampler,
         vertex_state,
-        shader: load_embedded_asset!(asset_server.as_ref(), "../shaders/apply_lightmap.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "shaders/apply_lightmap.wgsl"),
     });
 }
 
@@ -322,8 +380,98 @@ impl SpecializedRenderPipeline for LightmapApplicationPipeline {
             false => TextureFormat::bevy_default(),
         };
 
+        let mut shader_defs = vec![];
+        let mut combined = false;
+
+        if key.contains(LightPipelineKey::COMBINE_LIGHTMAPS) {
+            shader_defs.push("IS_COMBINED".into());
+            combined = true;
+        }
+
+        if key.contains(LightPipelineKey::LIGHTMAP_FILTERING) {
+            shader_defs.push("FILTER_LIGHTMAP".into());
+        }
+
+        let filter_lightmap = key.contains(LightPipelineKey::LIGHTMAP_FILTERING);
+
         RenderPipelineDescriptor {
             label: Some(Cow::Borrowed("lightmap application pipeline")),
+            layout: vec![self.specialize_layout(combined, filter_lightmap)],
+            vertex: self.vertex_state.clone(),
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                targets: vec![Some(ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+                shader_defs,
+                entry_point: Some(Cow::Borrowed("fragment")),
+            }),
+            push_constant_ranges: default(),
+            primitive: default(),
+            depth_stencil: default(),
+            multisample: MultisampleState {
+                count: key.msaa_samples(),
+                ..default()
+            },
+            zero_initialize_workgroup_memory: default(),
+        }
+    }
+}
+
+/// Pipeline that multiplies an array of lightmaps.
+#[derive(Resource)]
+pub struct LightmapCombinationPipeline {
+    pub layout: BindGroupLayoutDescriptor,
+    pub sampler: Sampler,
+    pub vertex_state: VertexState,
+    pub shader: Handle<Shader>,
+}
+
+#[derive(Component)]
+pub struct SpecializedCombinationPipeline(pub CachedRenderPipelineId);
+
+fn init_lightmap_combination_pipeline(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    fullscreen_shader: Res<FullscreenShader>,
+    asset_server: Res<AssetServer>,
+) {
+    let layout = BindGroupLayoutDescriptor::new(
+        "`combine lightmaps layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d_array(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                uniform_buffer::<UniformFireflyConfig>(false),
+            ),
+        ),
+    );
+
+    let sampler = render_device.create_sampler(&SamplerDescriptor::default());
+    let vertex_state = fullscreen_shader.to_vertex_state();
+
+    commands.insert_resource(LightmapCombinationPipeline {
+        layout,
+        sampler,
+        vertex_state,
+        shader: load_embedded_asset!(asset_server.as_ref(), "shaders/combine_lightmaps.wgsl"),
+    });
+}
+
+impl SpecializedRenderPipeline for LightmapCombinationPipeline {
+    type Key = LightPipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        let format = match key.contains(LightPipelineKey::HDR) {
+            true => ViewTarget::TEXTURE_FORMAT_HDR,
+            false => TextureFormat::bevy_default(),
+        };
+
+        RenderPipelineDescriptor {
+            label: Some(Cow::Borrowed("lightmap combination pipeline")),
             layout: vec![self.layout.clone()],
             vertex: self.vertex_state.clone(),
             fragment: Some(FragmentState {
@@ -397,7 +545,7 @@ fn init_sprite_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) 
     commands.insert_resource(SpritePipeline {
         view_layout,
         material_layout,
-        shader: load_embedded_asset!(asset_server.as_ref(), "../shaders/sprite.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "shaders/sprite.wgsl"),
     });
 }
 
@@ -484,7 +632,18 @@ impl SpecializedRenderPipeline for SpritePipeline {
                     offset: 68,
                     shader_location: 5,
                 },
+                // @location(6) y: f32,
+                VertexAttribute {
+                    format: VertexFormat::Float32,
+                    offset: 72,
+                    shader_location: 6,
+                },
             ],
+        };
+
+        let stencil_format = match key.contains(SpritePipelineKey::ENABLED_32BIT_STENCIL) {
+            false => TextureFormat::Rgba16Float,
+            true => TextureFormat::Rgba32Float,
         };
 
         RenderPipelineDescriptor {
@@ -500,12 +659,12 @@ impl SpecializedRenderPipeline for SpritePipeline {
                 entry_point: Some("fragment".into()),
                 targets: vec![
                     Some(ColorTargetState {
-                        format: TextureFormat::Rgba32Float, //format,
+                        format: stencil_format,
                         blend: Some(BlendState::ALPHA_BLENDING),
                         write_mask: ColorWrites::ALL,
                     }),
                     Some(ColorTargetState {
-                        format: TextureFormat::Rgba32Float,
+                        format: TextureFormat::Rgba16Float,
                         blend: Some(BlendState::ALPHA_BLENDING),
                         write_mask: ColorWrites::ALL,
                     }),
@@ -527,6 +686,59 @@ impl SpecializedRenderPipeline for SpritePipeline {
             label: Some("sprite_stencil_pipeline".into()),
             push_constant_ranges: Vec::new(),
             zero_initialize_workgroup_memory: false,
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
+    // NOTE: Apparently quadro drivers support up to 64x MSAA.
+    // MSAA uses the highest 3 bits for the MSAA log2(sample count) to support up to 128x MSAA.
+    pub struct SpritePipelineKey: u32 {
+        const NONE                              = 0;
+        const HDR                               = 1 << 0;
+        const TONEMAP_IN_SHADER                 = 1 << 1;
+        const DEBAND_DITHER                     = 1 << 2;
+        const MSAA_RESERVED_BITS                = Self::MSAA_MASK_BITS << Self::MSAA_SHIFT_BITS;
+        const TONEMAP_METHOD_RESERVED_BITS      = Self::TONEMAP_METHOD_MASK_BITS << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_NONE               = 0 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_REINHARD           = 1 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_REINHARD_LUMINANCE = 2 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_ACES_FITTED        = 3 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_AGX                = 4 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM = 5 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const ENABLED_32BIT_STENCIL = 1 << 31;
+    }
+}
+
+impl SpritePipelineKey {
+    const MSAA_MASK_BITS: u32 = 0b111;
+    const MSAA_SHIFT_BITS: u32 = 30 - Self::MSAA_MASK_BITS.count_ones();
+    const TONEMAP_METHOD_MASK_BITS: u32 = 0b111;
+    const TONEMAP_METHOD_SHIFT_BITS: u32 =
+        Self::MSAA_SHIFT_BITS - Self::TONEMAP_METHOD_MASK_BITS.count_ones();
+
+    #[inline]
+    pub const fn from_msaa_samples(msaa_samples: u32) -> Self {
+        let msaa_bits =
+            (msaa_samples.trailing_zeros() & Self::MSAA_MASK_BITS) << Self::MSAA_SHIFT_BITS;
+        Self::from_bits_retain(msaa_bits)
+    }
+
+    #[inline]
+    pub const fn msaa_samples(&self) -> u32 {
+        1 << ((self.bits() >> Self::MSAA_SHIFT_BITS) & Self::MSAA_MASK_BITS)
+    }
+
+    #[inline]
+    pub const fn from_hdr(hdr: bool) -> Self {
+        if hdr {
+            SpritePipelineKey::HDR
+        } else {
+            SpritePipelineKey::NONE
         }
     }
 }

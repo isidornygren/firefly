@@ -1,11 +1,14 @@
 //! Module that prepares BindGroups for GPU use.
 
-use std::f32::consts::PI;
+use core::f32;
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::{
-    LightmapPhase, NormalMapTexture, SpriteStencilTexture,
-    buffers::{BinBuffer, BufferManager, OccluderPointer, VertexBuffer},
-    data::{ExtractedWorldData, NormalMode},
+    CombinedLightMapTextures, LightmapPhase, NormalMapTexture, SpriteStencilTexture,
+    buffers::{BinBuffer, BinBuffers, BufferManager, OccluderData, OccluderPointer, VertexBuffer},
+    data::{
+        CombinationMode, ExtractedCombinedLightmaps, ExtractedWorldData, LightmapSize, NormalMode,
+    },
     lights::{LightBatch, LightBatches, LightBindGroups, LightIndex, LightLut, LightPointer},
     occluders::{PolyOccluderIndex, RoundOccluderIndex, point_inside_poly, translate_vertices},
     phases::SpritePhase,
@@ -21,10 +24,15 @@ use crate::{
 };
 
 use bevy::{
+    camera::visibility::RenderLayers,
     core_pipeline::tonemapping::{Tonemapping, TonemappingLuts, get_lut_bindings},
     math::{
         Affine3A,
         bounding::{Aabb2d, IntersectsVolume},
+    },
+    platform::{
+        collections::{HashMap, HashSet},
+        hash::FixedHasher,
     },
     prelude::*,
     render::{
@@ -32,12 +40,12 @@ use bevy::{
         render_asset::RenderAssets,
         render_phase::{PhaseItem, ViewBinnedRenderPhases, ViewSortedRenderPhases},
         render_resource::{
-            BindGroup, BindGroupEntries, PipelineCache, SpecializedRenderPipelines,
+            BindGroup, BindGroupEntries, Extent3d, PipelineCache, SpecializedRenderPipelines,
             TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, UniformBuffer,
         },
         renderer::{RenderDevice, RenderQueue},
         texture::{FallbackImage, GpuImage, TextureCache},
-        view::{ExtractedView, ViewTarget, ViewUniforms},
+        view::{ExtractedView, RetainedViewEntity, ViewTarget, ViewUniforms},
     },
     sprite_render::ExtractedSlices,
     tasks::{ComputeTaskPool, ParallelSliceMut},
@@ -88,41 +96,71 @@ impl Plugin for PreparePlugin {
 }
 
 fn specialize_light_application_pipeline(
-    views: Query<(Entity, &ExtractedView)>,
+    views: Query<(
+        Entity,
+        &ExtractedView,
+        &Msaa,
+        &FireflyConfig,
+        Has<CombinedLightMapTextures>,
+    )>,
     pipeline_cache: Res<PipelineCache>,
     pipeline: Res<LightmapApplicationPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<LightmapApplicationPipeline>>,
     mut commands: Commands,
 ) {
-    for (entity, view) in views {
-        let key = LightPipelineKey::from_hdr(view.hdr);
+    for (entity, view, _msaa, config, is_combined) in views {
+        let mut key = LightPipelineKey::from_hdr(view.hdr);
+        if is_combined {
+            key |= LightPipelineKey::COMBINE_LIGHTMAPS;
+        }
+
+        if config.lightmap_filtering {
+            key |= LightPipelineKey::LIGHTMAP_FILTERING;
+        }
+
         let pipeline_id = pipelines.specialize(&pipeline_cache, &pipeline, key);
 
         commands
             .entity(entity)
-            .insert(SpecializedApplicationPipeline(pipeline_id));
+            .insert(SpecializedApplicationPipeline {
+                id: pipeline_id,
+                is_combined,
+                filter_lightmap: config.lightmap_filtering,
+            });
     }
 }
 
 fn prepare_config(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    configs: Query<(Entity, &FireflyConfig)>,
+    configs: Query<(
+        Entity,
+        &FireflyConfig,
+        &ViewTarget,
+        Option<&ExtractedCombinedLightmaps>,
+    )>,
     mut commands: Commands,
 ) {
-    for (entity, config) in &configs {
+    for (entity, config, view_target, combined_lightmap) in &configs {
+        let window_size = view_target.main_texture().size();
+        let scale = match config.lightmap_size {
+            LightmapSize::Window => vec2(1.0, 1.0),
+            LightmapSize::Fixed(size) => vec2(
+                size.x as f32 / window_size.width as f32,
+                size.y as f32 / window_size.height as f32,
+            ),
+            LightmapSize::Scaled(scale) => vec2(1.0 / scale, 1.0 / scale),
+        };
+
         let uniform = UniformFireflyConfig {
             ambient_color: config.ambient_color.to_linear().to_vec3(),
             ambient_brightness: config.ambient_brightness,
 
-            light_bands: match config.light_bands {
-                None => 0.0,
-                Some(x) => x,
-            },
+            light_bands: config.light_bands.unwrap_or(0.0),
 
-            softness: match config.softness {
-                None => 0.,
-                Some(x) => x.min(1.).max(0.),
+            soft_shadows: match config.soft_shadows {
+                true => 1,
+                false => 0,
             },
 
             z_sorting: match config.z_sorting {
@@ -130,13 +168,31 @@ fn prepare_config(
                 true => 1,
             },
 
+            z_sorting_error_margin: config.z_sorting_error_margin,
+
             normal_mode: match config.normal_mode {
                 NormalMode::None => 0,
                 NormalMode::Simple => 1,
-                NormalMode::TopDown => 2,
+                NormalMode::TopDownY => 2,
+                NormalMode::TopDownZ => 3,
             },
 
             normal_attenuation: config.normal_attenuation,
+
+            n_combined_lightmaps: match combined_lightmap {
+                None => 0,
+                Some(x) => x.0.len() as u32,
+            },
+
+            combination_mode: match config.combination_mode {
+                CombinationMode::Multiply => 0,
+                CombinationMode::Add => 1,
+                CombinationMode::Max => 2,
+                CombinationMode::Min => 3,
+                CombinationMode::None => 4,
+            },
+
+            texture_scale: scale,
         };
         let mut buffer = UniformBuffer::<UniformFireflyConfig>::from(uniform);
         buffer.write_buffer(&render_device, &render_queue);
@@ -150,19 +206,42 @@ fn prepare_lightmap(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     mut texture_cache: ResMut<TextureCache>,
-    view_targets: Query<(Entity, &ViewTarget, &ExtractedView)>,
+    view_targets: Query<(
+        Entity,
+        &ViewTarget,
+        &ExtractedView,
+        Option<&ExtractedCombinedLightmaps>,
+        &FireflyConfig,
+        &Msaa,
+    )>,
 ) {
-    for (entity, view_target, view) in &view_targets {
+    for (entity, view_target, view, combined_lightmaps, config, _msaa) in &view_targets {
         let format = match view.hdr {
             true => ViewTarget::TEXTURE_FORMAT_HDR,
             false => TextureFormat::bevy_default(),
+        };
+
+        let window_size = view_target.main_texture().size();
+
+        let size = match config.lightmap_size {
+            LightmapSize::Window => window_size,
+            LightmapSize::Fixed(size) => Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            LightmapSize::Scaled(scale) => Extent3d {
+                width: (window_size.width as f32 * scale) as u32,
+                height: (window_size.height as f32 * scale) as u32,
+                depth_or_array_layers: 1,
+            },
         };
 
         let light_map_texture = texture_cache.get(
             &render_device,
             TextureDescriptor {
                 label: Some("lightmap"),
-                size: view_target.main_texture().size(),
+                size,
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
@@ -172,6 +251,11 @@ fn prepare_lightmap(
             },
         );
 
+        let stencil_format = match config.enable_32bit_stencils {
+            false => TextureFormat::Rgba16Float,
+            true => TextureFormat::Rgba32Float,
+        };
+
         let sprite_stencil_texture = texture_cache.get(
             &render_device,
             TextureDescriptor {
@@ -180,7 +264,7 @@ fn prepare_lightmap(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba32Float,
+                format: stencil_format,
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -194,7 +278,7 @@ fn prepare_lightmap(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba32Float,
+                format: TextureFormat::Rgba16Float,
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -205,6 +289,31 @@ fn prepare_lightmap(
             SpriteStencilTexture(sprite_stencil_texture),
             NormalMapTexture(normal_map_texture),
         ));
+
+        if let Some(combined_lightmaps) = combined_lightmaps
+            && !combined_lightmaps.0.is_empty()
+        {
+            let mut size = size;
+            size.depth_or_array_layers = combined_lightmaps.0.len() as u32;
+
+            let texture = texture_cache.get(
+                &render_device,
+                TextureDescriptor {
+                    label: Some("combined"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+            );
+
+            commands
+                .entity(entity)
+                .insert(CombinedLightMapTextures(texture));
+        }
     }
 }
 
@@ -216,10 +325,12 @@ pub(crate) fn prepare_data(
         &ExtractedPointLight,
         &mut LightPointer,
         &LightIndex,
-        &mut BinBuffer,
+        &mut BinBuffers,
     )>,
     occluders: Query<(&ExtractedOccluder, &RoundOccluderIndex, &PolyOccluderIndex)>,
-    camera: Single<(
+    cameras: Query<(
+        &ExtractedView,
+        &RenderLayers,
         &ExtractedWorldData,
         &Projection,
         &SpriteStencilTexture,
@@ -227,7 +338,7 @@ pub(crate) fn prepare_data(
         &BufferedFireflyConfig,
         &FireflyConfig,
     )>,
-    phases: Res<ViewBinnedRenderPhases<LightmapPhase>>,
+    _phases: Res<ViewBinnedRenderPhases<LightmapPhase>>,
     lightmap_pipeline: Res<LightmapCreationPipeline>,
     mut light_bind_groups: ResMut<LightBindGroups>,
     mut batches: ResMut<LightBatches>,
@@ -237,303 +348,498 @@ pub(crate) fn prepare_data(
     vertices: Res<VertexBuffer>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let Projection::Orthographic(projection) = camera.1 else {
-        return;
-    };
-
-    let camera_rect = Rect {
-        min: projection.area.min + camera.0.camera_pos,
-        max: projection.area.max + camera.0.camera_pos,
-    };
-
     batches.clear();
 
     let light_bind_groups = &mut *light_bind_groups;
 
     let mut lights: Vec<_> = lights.iter_mut().collect();
 
-    for (retained_view, _) in phases.iter() {
-        lights
-            .par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
-                let mut bind_groups: Vec<(Entity, BindGroup)> = vec![];
+    lights
+        .par_splat_map_mut(ComputeTaskPool::get(), None, |_, lights| {
+            let mut bind_groups: Vec<(Entity, HashMap<RetainedViewEntity, BindGroup>)> = vec![];
 
-                for (entity, light, light_pointer, light_index, bins) in lights {
-                    let Some(index) = light_index.0 else {
+            for (entity, light, light_pointer, light_index, bins) in lights {
+                let Some(index) = light_index.0 else {
+                    continue;
+                };
+
+                light_pointer.0.set(index.index as u32);
+                light_pointer.0.write_buffer(&render_device, &render_queue);
+
+                let Some(light_pointer_binding) = light_pointer.0.binding() else {
+                    continue;
+                };
+
+                let cameras = cameras
+                    .iter()
+                    .filter_map(|camera| {
+                        if !camera.1.intersects(&light.render_layers) {
+                            return None;
+                        }
+
+                        let Projection::Orthographic(projection) = camera.3 else {
+                            return None;
+                        };
+
+                        let camera_rect = Rect {
+                            min: projection.area.min + camera.2.camera_pos,
+                            max: projection.area.max + camera.2.camera_pos,
+                        };
+
+                        let light_rect = camera_rect.union_point(light.pos).intersect(Rect {
+                            min: light.pos - light.radius,
+                            max: light.pos + light.radius,
+                        });
+
+                        if light_rect.is_empty() {
+                            return None;
+                        }
+
+                        let light_aabb = Aabb2d {
+                            min: light_rect.min,
+                            max: light_rect.max,
+                        };
+
+                        let bins = bins
+                            .0
+                            .entry(camera.0.retained_view_entity)
+                            .or_insert(default());
+                        bins.reset();
+
+                        Some((camera, light_aabb))
+                    })
+                    .collect::<Vec<_>>();
+
+                for (occluder, round_index, poly_index) in &occluders {
+                    if !light.cast_shadows
+                        || !light.render_layers.intersects(&occluder.render_layers)
+                    {
                         continue;
-                    };
-
-                    light_pointer.0.set(index.index as u32);
-                    light_pointer.0.write_buffer(&render_device, &render_queue);
-
-                    let light_rect = camera_rect.union_point(light.pos).intersect(Rect {
-                        min: light.pos - light.range,
-                        max: light.pos + light.range,
-                    });
-
-                    let light_aabb = Aabb2d {
-                        min: light_rect.min,
-                        max: light_rect.max,
-                    };
-
-                    bins.reset();
-
-                    let softness = match camera.5.softness {
-                        None => 0.0,
-                        Some(x) => x.clamp(0.0, 1.0),
-                    };
-
-                    for (occluder, round_index, poly_index) in &occluders {
-                        if !light.cast_shadows || !occluder.aabb.intersects(&light_aabb) {
-                            continue;
-                        }
-
-                        if let Occluder2dShape::RoundRectangle {
-                            width,
-                            height,
-                            radius,
-                        } = occluder.shape
-                        {
-                            let Some(occluder_index) = round_index.0 else {
-                                continue;
-                            };
-
-                            let vertices = vec![
-                                vec2(-width / 2.0 - radius, -height / 2.0 - radius),
-                                vec2(-width / 2.0 - radius, height / 2.0 + radius),
-                                vec2(width / 2.0 + radius, height / 2.0 + radius),
-                                vec2(width / 2.0 + radius, -height / 2.0 - radius),
-                                vec2(-width / 2.0 - radius, -height / 2.0 - radius),
-                            ];
-
-                            let isometry = Isometry2d {
-                                translation: occluder.pos,
-                                rotation: Rot2::radians(occluder.rot),
-                            };
-                            let aabb = Aabb2d::from_point_cloud(isometry, &vertices);
-
-                            let vertices = translate_vertices(
-                                vertices,
-                                isometry.translation,
-                                isometry.rotation,
-                            );
-
-                            let light_inside_occluder =
-                                point_inside_poly(light.pos, vertices.clone(), aabb);
-
-                            let closest = aabb.closest_point(light.pos);
-
-                            push_vertices(
-                                bins,
-                                vertices,
-                                light.pos,
-                                0,
-                                occluder_index.index as u32,
-                                softness,
-                                closest.distance(light.pos),
-                                light_inside_occluder,
-                                false,
-                            );
-                        } else {
-                            let Some(occluder_index) = poly_index.occluder else {
-                                continue;
-                            };
-
-                            let Some(vertex_index) = poly_index.vertices else {
-                                continue;
-                            };
-
-                            let light_inside_occluder =
-                                matches!(occluder.shape, Occluder2dShape::Polygon { .. })
-                                    && point_inside_poly(
-                                        light.pos,
-                                        occluder.vertices(),
-                                        occluder.aabb,
-                                    );
-
-                            let closest = occluder.aabb.closest_point(light.pos);
-
-                            push_vertices(
-                                bins,
-                                occluder.vertices(),
-                                light.pos,
-                                vertex_index.index as u32,
-                                occluder_index.index as u32,
-                                softness,
-                                closest.distance(light.pos),
-                                light_inside_occluder,
-                                true,
-                            );
-                        }
                     }
 
-                    bins.write(&render_device, &render_queue);
+                    let mut any_soft_shadows = false;
 
-                    bind_groups.push((
-                        *entity,
+                    let mut retained_views: HashSet<_, FixedHasher> = HashSet::default();
+
+                    cameras.iter().for_each(|(camera, light_aabb)| {
+                        if !occluder.aabb.intersects(light_aabb)
+                            || !camera.1.intersects(&occluder.render_layers)
+                        {
+                            return;
+                        }
+
+                        any_soft_shadows |= camera.7.soft_shadows;
+
+                        retained_views.insert(camera.0.retained_view_entity);
+                    });
+
+                    let bins = bins
+                        .0
+                        .iter_mut()
+                        .filter(|(retained_view, _bin)| retained_views.contains(*retained_view))
+                        .map(|(_, x)| x)
+                        .collect::<Vec<_>>();
+
+                    if let Occluder2dShape::RoundRectangle {
+                        half_width,
+                        half_height,
+                        radius,
+                    } = occluder.shape
+                    {
+                        let Some(occluder_index) = round_index.0 else {
+                            continue;
+                        };
+
+                        let vertices = vec![
+                            vec2(-half_width - radius, -half_height - radius),
+                            vec2(-half_width - radius, half_height + radius),
+                            vec2(half_width + radius, half_height + radius),
+                            vec2(half_width + radius, -half_height - radius),
+                        ];
+
+                        let light_pos =
+                            Vec2::from_angle(-occluder.rot).rotate(light.pos - occluder.pos);
+
+                        let aabb = Aabb2d {
+                            min: vec2(-half_width - radius, -half_height - radius),
+                            max: vec2(half_width + radius, half_height + radius),
+                        };
+
+                        let isometry = Isometry2d {
+                            translation: occluder.pos,
+                            rotation: Rot2::radians(occluder.rot),
+                        };
+
+                        let vertices =
+                            translate_vertices(vertices, isometry.translation, isometry.rotation);
+
+                        let closest = aabb.closest_point(light_pos);
+                        let light_inside_occluder = closest == light_pos;
+
+                        push_vertices(
+                            bins,
+                            &vertices,
+                            light.pos,
+                            light.core.radius,
+                            0,
+                            occluder_index.index as u32,
+                            closest.distance(light_pos),
+                            // 0.0,
+                            light_inside_occluder,
+                            false,
+                            any_soft_shadows,
+                            true,
+                        );
+                    } else {
+                        let Some(occluder_index) = poly_index.occluder else {
+                            continue;
+                        };
+
+                        let Some(vertex_index) = poly_index.vertices else {
+                            continue;
+                        };
+
+                        let vertices = occluder.vertices();
+
+                        let light_inside_occluder =
+                            matches!(occluder.shape, Occluder2dShape::Polygon { .. })
+                                && point_inside_poly(
+                                    light.pos,
+                                    &vertices,
+                                    occluder.aabb,
+                                    occluder.shape.is_concave(),
+                                );
+
+                        let closest = occluder.aabb.closest_point(light.pos);
+
+                        push_vertices(
+                            bins,
+                            &vertices,
+                            light.pos,
+                            light.core.radius,
+                            vertex_index.index as u32,
+                            occluder_index.index as u32,
+                            closest.distance(light.pos),
+                            light_inside_occluder,
+                            true,
+                            any_soft_shadows,
+                            occluder.shape.is_concave(),
+                        );
+                    }
+                }
+
+                let mut bind_group = HashMap::default();
+                for (camera, _) in cameras {
+                    let bins = bins.0.get_mut(&camera.0.retained_view_entity).unwrap();
+                    bins.write(&render_device, &render_queue);
+                    bind_group.insert(
+                        camera.0.retained_view_entity,
                         render_device.create_bind_group(
                             "light bind group",
                             &pipeline_cache.get_bind_group_layout(&lightmap_pipeline.layout),
                             &BindGroupEntries::sequential((
                                 &lightmap_pipeline.sampler,
                                 light_buffer.binding(),
-                                light_pointer.0.binding().unwrap(),
+                                light_pointer_binding.clone(),
                                 round_occluders.binding(),
                                 poly_occluders.binding(),
                                 vertices.binding(),
                                 bins.bin_binding(),
-                                bins.bin_count_binding(),
-                                &camera.2.0.default_view,
-                                &camera.3.0.default_view,
-                                camera.4.0.binding().unwrap(),
+                                bins.bin_indices_binding(),
+                                &camera.4.0.default_view,
+                                &camera.5.0.default_view,
+                                camera.6.0.binding().unwrap(),
                             )),
                         ),
-                    ));
+                    );
                 }
-                bind_groups
-            })
-            .iter()
-            .for_each(|bind_groups| {
-                for (entity, bind_group) in bind_groups {
-                    light_bind_groups
-                        .values
-                        .entry(*entity)
-                        .insert(bind_group.clone());
 
+                bind_groups.push((*entity, bind_group));
+            }
+            bind_groups
+        })
+        .iter()
+        .for_each(|bind_groups| {
+            for (entity, bind_group) in bind_groups {
+                light_bind_groups
+                    .values
+                    .entry(*entity)
+                    .insert(bind_group.clone());
+
+                for retained_view in bind_group.keys() {
                     batches
                         .entry((*retained_view, *entity))
                         .insert(LightBatch { id: *entity });
                 }
-            });
+            }
+        });
+}
+
+#[derive(Debug, Default)]
+struct OccluderSlice {
+    pub start_index: usize,
+    pub start_vertex: u32,
+
+    pub split: Option<u32>,
+    pub length: u32,
+
+    pub start_angle: f32,
+    pub angle: f32,
+}
+
+impl OccluderSlice {
+    fn new(index: usize, vertex: &Vertex) -> Self {
+        OccluderSlice {
+            start_index: index,
+            start_vertex: vertex.index,
+            split: None,
+            length: 1,
+            start_angle: vertex.angle,
+            angle: 0.0,
+        }
     }
 }
 
-#[derive(Default)]
-struct OccluderSlice {
-    pub start: u32,
-    pub length: u32,
-    pub term: u32,
-
-    pub start_angle: f32,
-    pub end_angle: f32,
-}
-
+#[derive(Debug, Clone, Copy)]
 struct Vertex {
     pub index: u32,
     pub angle: f32,
 }
 
 fn push_vertices(
-    bins: &mut BinBuffer,
-    occluder_vertices: Vec<Vec2>,
+    mut bins: Vec<&mut BinBuffer>,
+    occluder_vertices: &[Vec2],
     light_pos: Vec2,
+    light_radius: f32,
     start_vertex: u32,
     index: u32,
-    softness: f32,
     distance: f32,
     rev: bool,
     poly: bool,
+    soft_shadows: bool,
+    concave: bool,
 ) {
-    let mut push_slice = |slice: &OccluderSlice| {
-        if slice.length > 1 {
-            let rev: u32 = match rev {
-                true => 1,
-                false => 0,
-            };
-
-            let index = match poly {
-                true => (1 << 31) | (slice.term << 29) | (rev << 28) | index as u32,
-                false => (0 << 31) | index as u32,
-            };
-
-            let occluder = OccluderPointer {
-                index,
-                min_v: slice.start + start_vertex,
-                length: slice.length,
-                distance,
-            };
-
-            match slice.term {
-                0 => bins.add_occluder(
-                    occluder,
-                    slice.start_angle - softness,
-                    slice.end_angle + softness,
-                ),
-                1 => bins.add_occluder(occluder, slice.start_angle - softness, PI),
-                2 => bins.add_occluder(occluder, -PI, slice.end_angle + softness),
-                _ => {}
-            }
-        }
+    let index = match poly {
+        true => (1 << 31) | index,
+        false => index,
     };
+
+    if !poly && rev {
+        bins.iter_mut().for_each(|bins| {
+            bins.add_occluder(&OccluderData {
+                pointer: OccluderPointer {
+                    index,
+                    distance,
+                    ..default()
+                },
+                min_angle: 0.0,
+                angle: TAU,
+            })
+        });
+        return;
+    }
+    // info!("pushing vertices: {occluder_vertices:?}");
+    // info!("start vertex: {start_vertex}");
 
     let vertices = occluder_vertices.iter().enumerate().map(|(i, v)| Vertex {
         index: i as u32,
         angle: (v.y - light_pos.y).atan2(v.x - light_pos.x),
     });
 
-    let vertices: Vec<_> = if !rev {
+    let mut vertices: Vec<_> = if !rev {
         vertices.collect()
     } else {
         vertices.rev().collect()
     };
 
+    let mut round_occlusion = false;
+
+    if concave && rev {
+        round_occlusion = true;
+    } else {
+        loop {
+            let last = vertices.last().unwrap().angle;
+            let vertex = vertices.first().unwrap().angle;
+
+            let loops = (vertex - last).abs() > PI;
+
+            if (!loops && vertex <= last) || (loops && vertex >= last) {
+                break;
+            }
+
+            vertices.rotate_right(1);
+
+            if rev && vertices.last().unwrap().index == 0 {
+                round_occlusion = true;
+                break;
+            }
+        }
+    }
+
+    // info!("");
+    // info!("---------");
+    let mut push_slice = |slice: &OccluderSlice, vertices: &[Vertex]| {
+        if slice.length > 1 {
+            let rev: u32 = match rev {
+                true => 1,
+                false => 0,
+            };
+
+            // info!("pushing {slice:?}! poly: {poly}");
+
+            // info!(
+            //     "slice start: {}, slice length: {}",
+            //     slice.start_vertex, slice.length
+            // );
+
+            let min_v = (rev << 29) | (slice.start_vertex + start_vertex);
+            let length = slice.length;
+
+            let angle_left = if !soft_shadows || light_radius <= 0.0 {
+                0.0
+            } else {
+                let left = occluder_vertices[vertices[slice.start_index].index as usize];
+                (light_pos - left)
+                    .normalize()
+                    .dot(
+                        (light_pos
+                            + Vec2::from_angle(FRAC_PI_2)
+                                .rotate(left - light_pos)
+                                .normalize()
+                                * light_radius
+                            - left)
+                            .normalize(),
+                    )
+                    .acos()
+            };
+
+            let angle_right = if !soft_shadows || light_radius <= 0.0 {
+                0.0
+            } else {
+                let right = occluder_vertices
+                    [vertices[slice.start_index + slice.length as usize - 1].index as usize];
+                (light_pos - right)
+                    .normalize()
+                    .dot(
+                        (light_pos
+                            + Vec2::from_angle(FRAC_PI_2)
+                                .rotate(right - light_pos)
+                                .normalize()
+                                * light_radius
+                            - right)
+                            .normalize(),
+                    )
+                    .acos()
+            };
+
+            match slice.split {
+                None => {
+                    let data = OccluderData {
+                        pointer: OccluderPointer {
+                            index,
+                            min_v,
+                            split: 0,
+                            length,
+                            distance,
+                        },
+                        min_angle: slice.start_angle - angle_left,
+                        angle: slice.angle + angle_left + angle_right,
+                    };
+
+                    bins.iter_mut().for_each(|bins| {
+                        bins.add_occluder(&data);
+                    });
+                }
+                Some(split) => {
+                    let data1 = OccluderData {
+                        pointer: OccluderPointer {
+                            index,
+                            min_v: (1 << 30) | min_v,
+                            split,
+                            length,
+                            distance,
+                        },
+                        min_angle: slice.start_angle - angle_left,
+                        angle: slice.angle + angle_left + angle_right,
+                    };
+
+                    let data2 = OccluderData {
+                        pointer: OccluderPointer {
+                            index,
+                            min_v: (2 << 30) | min_v,
+                            split,
+                            length,
+                            distance,
+                        },
+                        min_angle: slice.start_angle - angle_left,
+                        angle: slice.angle + angle_left + angle_right,
+                    };
+
+                    bins.iter_mut().for_each(|bins| {
+                        bins.add_occluder(&data1);
+                        bins.add_occluder(&data2);
+                    });
+                }
+            }
+        }
+    };
+
     let mut last: Option<&Vertex> = None;
     let mut slice: OccluderSlice = default();
 
-    for vertex in &vertices {
-        if let Some(last) = last {
-            let loops = (vertex.angle - last.angle).abs() > PI;
+    if !round_occlusion {
+        for (index, vertex) in vertices.iter().enumerate() {
+            if let Some(last) = last {
+                let loops = (vertex.angle - last.angle).abs() > PI;
 
-            // if the next vertex is decreasing
-            if (!loops && vertex.angle < last.angle) || (loops && vertex.angle > last.angle) {
-                push_slice(&slice);
-                slice = OccluderSlice {
-                    start: vertex.index,
-                    length: 1,
-                    term: 0,
-                    start_angle: vertex.angle,
-                    end_angle: vertex.angle,
-                };
-            }
-            // if the next vertex is increasing, simple case
-            else if !loops && vertex.angle > last.angle {
-                if slice.length == 0 {
-                    slice.start = vertex.index;
+                // if the next vertex is decreasing
+                if (!loops && vertex.angle <= last.angle) || (loops && vertex.angle >= last.angle) {
+                    push_slice(&slice, &vertices);
+                    slice = OccluderSlice::new(index, vertex);
                 }
-                slice.length += 1;
-                slice.end_angle = vertex.angle;
-            }
-            // if the next vertex is increasing and loops over
-            else {
-                if slice.length == 0 {
-                    slice.start = vertex.index;
+                // if the next vertex is increasing, simple case
+                else if !loops && vertex.angle > last.angle {
+                    slice.length += 1;
+                    slice.angle += vertex.angle - last.angle;
                 }
-                slice.length += 1;
-                slice.term = 1;
+                // if the next vertex is increasing and loops over
+                else {
+                    slice.split = Some(slice.length);
+                    slice.length += 1;
 
-                push_slice(&slice);
-
-                slice = OccluderSlice {
-                    start: last.index,
-                    length: 2,
-                    term: 2,
-                    start_angle: last.angle,
-                    end_angle: vertex.angle,
-                };
+                    slice.angle += vertex.angle - last.angle + TAU;
+                }
+            } else {
+                slice = OccluderSlice::new(index, vertex);
             }
-        } else {
-            slice = OccluderSlice {
-                start: vertex.index,
-                length: 1,
-                term: 0,
-                start_angle: vertex.angle,
-                end_angle: vertex.angle,
-            };
+
+            last = Some(vertex);
         }
 
-        last = Some(vertex);
-    }
+        push_slice(&slice, &vertices);
+    } else {
+        vertices.push(vertices[0]);
+        for (index, vertex) in vertices.iter().enumerate() {
+            if let Some(last) = last {
+                let loops = (vertex.angle - last.angle).abs() > PI;
 
-    push_slice(&slice);
+                if !loops {
+                    slice.length += 1;
+                    slice.angle += vertex.angle - last.angle;
+                } else {
+                    slice.split = Some(slice.length);
+                    slice.length += 1;
+
+                    slice.angle += vertex.angle - last.angle + TAU;
+                }
+            } else {
+                slice = OccluderSlice::new(index, vertex);
+            }
+
+            last = Some(vertex);
+        }
+        push_slice(&slice, &vertices);
+    }
 }
 
 fn prepare_light_luts(
@@ -688,6 +994,10 @@ fn prepare_sprite_image_bind_groups(
                 let mut dummy_buffer = UniformBuffer::<u32>::from(if is_dummy { 1 } else { 0 });
                 dummy_buffer.write_buffer(&render_device, &render_queue);
 
+                let Some(dummy_buffer_binding) = dummy_buffer.binding() else {
+                    continue;
+                };
+
                 image_bind_groups
                     .values
                     .entry((batch_image_handle, batch_normal_handle, is_dummy))
@@ -699,7 +1009,7 @@ fn prepare_sprite_image_bind_groups(
                                 &gpu_image.texture_view,
                                 &normal_image.texture_view,
                                 &gpu_image.sampler,
-                                dummy_buffer.binding().unwrap(),
+                                dummy_buffer_binding,
                             )),
                         )
                     });
@@ -785,9 +1095,13 @@ fn prepare_sprite_image_bind_groups(
                             &uv_offset_scale,
                             extracted_sprite.transform.translation().z,
                             extracted_sprite.height,
+                            extracted_sprite.transform.translation().y,
                         ));
 
-                    current_batch.as_mut().unwrap().get_mut().range.end += 1;
+                    if let Some(batch) = current_batch.as_mut() {
+                        batch.get_mut().range.end += 1;
+                    }
+                    // current_batch.as_mut().unwrap().get_mut().range.end += 1;
                     index += 1;
                 }
                 ExtractedFireflySpriteKind::Slices { ref indices } => {
@@ -831,9 +1145,13 @@ fn prepare_sprite_image_bind_groups(
                                 &uv_offset_scale,
                                 extracted_sprite.transform.translation().z,
                                 extracted_sprite.height,
+                                extracted_sprite.transform.translation().y,
                             ));
 
-                        current_batch.as_mut().unwrap().get_mut().range.end += 1;
+                        if let Some(batch) = current_batch.as_mut() {
+                            batch.get_mut().range.end += 1;
+                        }
+                        // current_batch.as_mut().unwrap().get_mut().range.end += 1;
                         index += 1;
                     }
                 }

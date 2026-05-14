@@ -1,4 +1,4 @@
-# Firefly
+# Firefly - 2D Lighting for Bevy 
 
 [![Discord](https://img.shields.io/discord/805147867924267018?logo=discord&color=7289DA)](https://discord.com/channels/691052431525675048/1447681362722033816)
 [![crates.io](https://img.shields.io/crates/v/bevy_firefly)](https://crates.io/crates/bevy_firefly)
@@ -6,11 +6,6 @@
 [![downloads](https://img.shields.io/crates/d/bevy_firefly)](https://crates.io/crates/bevy_firefly)
 
 [Firefly](https://crates.io/crates/bevy_firefly) is an open-source, **2d lighting** crate for the [Bevy game engine](https://bevy.org/). 
-
-## Important Note - HDR !
-HDR support is planned as being part of the next big update that I'm working on, `0.18.1`. However, mainly due to the Bevy Jam having started and the full update still being far from done, I've released a `0.18.1-alpha` version 
-which just adds HDR support and a couple of other things. Check out the [release notes](https://github.com/PVDoriginal/firefly/blob/main/release-notes/0.18.1-alpha.md) for more details. I'm adding this here because cargo seems to still default to 
-`0.18.0` as the newest version, so you'll need to manually change it to have access to HDR. It is a pretty huge visual improvement with almost no performance cost! 
 
 ## Objective
 
@@ -32,6 +27,10 @@ https://github.com/user-attachments/assets/1984ef2a-0edd-4a40-93cb-a901057a9b74
 Same scene but with light banding and hard shadows.
 
 https://github.com/user-attachments/assets/6118f75e-b797-41bb-998e-381dc9d84cb9
+
+Video of the [flashlight example](https://github.com/PVDoriginal/firefly/blob/main/examples/flashlight.rs).
+
+https://github.com/user-attachments/assets/4c525c50-39a6-4604-904e-65f38676f4c7
 
 Video of the [crates example](https://github.com/PVDoriginal/firefly/blob/main/examples/shapes.rs), showcasing normal maps and z-sorting.
 
@@ -91,11 +90,11 @@ Some of the existing features are:
   - Normal maps
   - Transparent & colored occluders
   - Light banding
+  - Multiple Lightmaps
+  - Render Layers 
 
 Some of the currently planned features are: 
   - Occluders casting sprite-based shadows
-  - Mulitple lightmaps
-  - Dithering
   - Light textures
 
 Check out my [milestone goals](https://github.com/users/PVDoriginal/projects/7/views/2) to see what features are currently planned based on the Bevy release cycle. 
@@ -121,7 +120,6 @@ Unlike Bevy, Firefly can have breaking API changes in every release.
 ## Current Limitations 
 
 Some notable limitations that Firefly currently has: 
-  - Currently the `FireflyConfig` component can only be added to a single camera at one time. Having multiple cameras in your app is fine, but only one of them can render lights for now. 
   - WebGPU only. I've chosen to drop WebGL2 support in favor of WebGPU and the many possibilities it offers, which means Firefly might not run on specific browsers / devices yet (although WebGPU support is rapidly growing). I am willing to add and maintain a WebGL2 compatibility mode if there's a significant need for it though. 
   - Firefly was mostly designed to work with Sprites, which means there is limited compatibility with 2d Meshes. While lights can be cast over them, they don't yet support normal maps or occlusion z-sorting. This will be changed very soon as Bevy's Sprite backend is being migrated to the mesh one.
   - Occluder scaling isn't supported yet. 

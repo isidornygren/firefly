@@ -1,6 +1,7 @@
 //! This module extracts data from the Main World to the Render World.
 
 use bevy::{
+    camera::visibility::RenderLayers,
     platform::collections::HashSet,
     prelude::*,
     render::{
@@ -20,7 +21,10 @@ use bevy::{
 use crate::{
     LightmapPhase,
     change::Changes,
-    data::{ExtractedWorldData, FireflyConfig},
+    data::{
+        CombineLightmapTo, CombinedLightmaps, ExtractedCombineLightmapTo,
+        ExtractedCombinedLightmaps, ExtractedWorldData, FireflyConfig,
+    },
     lights::{ExtractedPointLight, LightHeight, PointLight2d},
     occluders::ExtractedOccluder,
     phases::SpritePhase,
@@ -232,12 +236,39 @@ fn extract_sprites(
 
 fn extract_world_data(
     mut commands: Commands,
-    camera: Extract<Query<(&RenderEntity, &GlobalTransform, &FireflyConfig, &Camera2d)>>,
+    cameras: Extract<Query<(&RenderEntity, &Camera), With<CombineLightmapTo>>>,
+    camera: Extract<
+        Query<(
+            &RenderEntity,
+            &GlobalTransform,
+            &FireflyConfig,
+            Option<&CombinedLightmaps>,
+        )>,
+    >,
 ) {
-    for (entity, transform, _, _) in &camera {
+    for (entity, transform, _, combined_lightmaps) in &camera {
         commands.entity(entity.id()).insert(ExtractedWorldData {
             camera_pos: transform.translation().truncate(),
         });
+
+        if let Some(combined_lightmaps) = combined_lightmaps {
+            let mut extracted_collection = vec![];
+            for (i, main_entity) in combined_lightmaps.collection().iter().enumerate() {
+                let (render_entity, camera) = cameras.get(*main_entity).unwrap();
+                if !camera.is_active {
+                    continue;
+                }
+
+                commands
+                    .entity(render_entity.entity())
+                    .insert(ExtractedCombineLightmapTo(entity.id(), i as u32));
+                extracted_collection.push(**render_entity);
+            }
+
+            commands
+                .entity(entity.id())
+                .insert(ExtractedCombinedLightmaps(extracted_collection));
+        }
     }
 }
 
@@ -252,10 +283,13 @@ fn extract_lights(
             &ViewVisibility,
             &VisibilityTimer,
             &Changes,
+            &RenderLayers,
         )>,
     >,
 ) {
-    for (entity, transform, light, height, visibility, visibility_timer, changes) in &lights {
+    for (entity, transform, light, height, visibility, visibility_timer, changes, render_layers) in
+        &lights
+    {
         if !visibility.get() {
             if visibility_timer.0.just_finished() {
                 commands.entity(entity).insert(NotVisible);
@@ -263,21 +297,21 @@ fn extract_lights(
             continue;
         }
 
-        let pos = transform.translation().truncate() - vec2(0.0, height.0) + light.offset.xy();
+        let pos = transform.translation().truncate() /*+ vec2(0.0, height.0)*/ + light.offset.xy();
         commands.entity(entity).insert(ExtractedPointLight {
             pos,
             color: light.color,
             intensity: light.intensity,
-            range: light.range,
+            radius: light.radius,
             z: transform.translation().z + light.offset.z,
-            inner_range: light.inner_range,
+            core: light.core,
             falloff: light.falloff,
-            falloff_intensity: light.falloff_intensity,
             angle: light.angle,
             cast_shadows: light.cast_shadows,
             dir: (transform.rotation() * Vec3::Y).xy(),
             height: height.0,
             changes: changes.clone(),
+            render_layers: render_layers.clone(),
         });
     }
 }
@@ -294,13 +328,22 @@ fn extract_occluders(
             &ViewVisibility,
             &VisibilityTimer,
             &Changes,
+            &RenderLayers,
         )>,
     >,
 ) {
     let mut values = Vec::with_capacity(*previous_len);
 
-    for (entity, occluder, global_transform, aabb, visibility, visibility_timer, changes) in
-        &occluders
+    for (
+        entity,
+        occluder,
+        global_transform,
+        aabb,
+        visibility,
+        visibility_timer,
+        changes,
+        render_layers,
+    ) in &occluders
     {
         if !visibility.get() {
             if visibility_timer.0.just_finished() {
@@ -321,6 +364,7 @@ fn extract_occluders(
             opacity: occluder.opacity,
             z_sorting: occluder.z_sorting,
             changes: changes.clone(),
+            render_layers: render_layers.clone(),
         };
 
         values.push((entity, extracted_occluder));

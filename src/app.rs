@@ -71,7 +71,7 @@ impl Plugin for FireflyPlugin {
 
 /// Plugin that shows gizmos for firefly occluders.
 ///
-/// Useful for debugging.
+/// Useful for debugging. Insert the [`FireflyGizmoStyle`] resource to configure.
 pub struct FireflyGizmosPlugin;
 
 impl Plugin for FireflyGizmosPlugin {
@@ -108,8 +108,8 @@ fn draw_gizmos(
     for (transform, light) in lights {
         let isometry = Isometry2d::from_translation(transform.translation().xy());
 
-        gizmos.circle_2d(isometry, light.inner_range, style.light_inner_color);
-        gizmos.circle_2d(isometry, light.range, style.light_outer_color);
+        gizmos.circle_2d(isometry, light.core.radius, style.light_inner_color);
+        gizmos.circle_2d(isometry, light.radius, style.light_outer_color);
     }
 
     for (transform, occluder) in &occluders {
@@ -142,13 +142,11 @@ fn draw_gizmos(
                 }
             }
             Occluder2dShape::RoundRectangle {
-                width,
-                height,
+                half_width,
+                half_height,
                 radius,
             } => {
                 let center = transform.translation().truncate() + occluder.offset.xy();
-                let width = width / 2.;
-                let height = height / 2.;
 
                 let rot = Rot2::radians(transform.rotation().to_euler(EulerRot::XYZ).2);
                 let rotate =
@@ -156,36 +154,36 @@ fn draw_gizmos(
 
                 // top line
                 gizmos.line_2d(
-                    center + rotate(vec2(-width, height + radius)),
-                    center + rotate(vec2(width, height + radius)),
+                    center + rotate(vec2(-half_width, half_height + radius)),
+                    center + rotate(vec2(half_width, half_height + radius)),
                     style.occluder_color,
                 );
 
                 // right line
                 gizmos.line_2d(
-                    center + rotate(vec2(width + radius, height)),
-                    center + rotate(vec2(width + radius, -height)),
+                    center + rotate(vec2(half_width + radius, half_height)),
+                    center + rotate(vec2(half_width + radius, -half_height)),
                     style.occluder_color,
                 );
 
                 // bottom line
                 gizmos.line_2d(
-                    center + rotate(vec2(-width, -height - radius)),
-                    center + rotate(vec2(width, -height - radius)),
+                    center + rotate(vec2(-half_width, -half_height - radius)),
+                    center + rotate(vec2(half_width, -half_height - radius)),
                     style.occluder_color,
                 );
 
                 // left line
                 gizmos.line_2d(
-                    center + rotate(vec2(-width - radius, height)),
-                    center + rotate(vec2(-width - radius, -height)),
+                    center + rotate(vec2(-half_width - radius, half_height)),
+                    center + rotate(vec2(-half_width - radius, -half_height)),
                     style.occluder_color,
                 );
 
                 // top-left arc
                 gizmos.arc_2d(
                     Isometry2d {
-                        translation: center + rotate(vec2(-width, height)),
+                        translation: center + rotate(vec2(-half_width, half_height)),
                         rotation: Rot2::radians(transform.rotation().to_euler(EulerRot::XYZ).2),
                     },
                     FRAC_PI_2,
@@ -196,7 +194,7 @@ fn draw_gizmos(
                 // top-right arc
                 gizmos.arc_2d(
                     Isometry2d {
-                        translation: center + rotate(vec2(width, height)),
+                        translation: center + rotate(vec2(half_width, half_height)),
                         rotation: Rot2::radians(
                             transform.rotation().to_euler(EulerRot::XYZ).2 - FRAC_PI_2,
                         ),
@@ -209,7 +207,7 @@ fn draw_gizmos(
                 // bottom-right arc
                 gizmos.arc_2d(
                     Isometry2d {
-                        translation: center + rotate(vec2(width, -height)),
+                        translation: center + rotate(vec2(half_width, -half_height)),
                         rotation: Rot2::radians(
                             transform.rotation().to_euler(EulerRot::XYZ).2 + PI,
                         ),
@@ -222,7 +220,7 @@ fn draw_gizmos(
                 // bottom-left arc
                 gizmos.arc_2d(
                     Isometry2d {
-                        translation: center + rotate(vec2(-width, -height)),
+                        translation: center + rotate(vec2(-half_width, -half_height)),
                         rotation: Rot2::radians(
                             transform.rotation().to_euler(EulerRot::XYZ).2 + FRAC_PI_2,
                         ),

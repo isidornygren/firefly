@@ -1,6 +1,7 @@
 use std::usize;
 
 use bevy::{
+    camera::visibility::RenderLayers,
     color::palettes::css::WHITE,
     prelude::*,
     render::{extract_component::ExtractComponent, render_resource::ShaderType},
@@ -15,8 +16,9 @@ pub(crate) struct ExtractedWorldData {
 ///
 /// # Panics
 /// Panics if added to multiple cameras at once.
-#[derive(Component, ExtractComponent, Clone, Reflect)]
-#[require(Transform)]
+#[derive(Debug, Component, ExtractComponent, Clone, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[require(Transform, RenderLayers)]
 pub struct FireflyConfig {
     /// Ambient light that will be added over all other lights.  
     ///
@@ -40,12 +42,8 @@ pub struct FireflyConfig {
 
     /// Whether you want to use soft shadows or not.
     ///
-    /// Softness corresponds to the angle that the soft shadows are stretched over. Should be between 0 and 1 (corresponding to 0 to 90 degress).
-    ///
-    /// **Performance Impact:** Minor.
-    ///
-    /// **Default:** Some(0.7).
-    pub softness: Option<f32>,
+    /// **Default:** true.
+    pub soft_shadows: bool,
 
     /// Whether to use occlusion z-sorting or not.
     ///
@@ -57,6 +55,8 @@ pub struct FireflyConfig {
     ///
     /// **Default:** true.
     pub z_sorting: bool,
+
+    pub z_sorting_error_margin: f32,
 
     /// Field that controls how the normal maps are applied relative to perspective.
     ///
@@ -73,6 +73,68 @@ pub struct FireflyConfig {
     ///
     /// **Default:** 0.5.
     pub normal_attenuation: f32,
+
+    /// Specifies how other firefly cameras connected to this camera via the [`CombineLightmapTo`] component will
+    /// be combined to the resulting lightmap.
+    ///
+    /// **Default:** Multiply.
+    pub combination_mode: CombinationMode,
+
+    /// Sets the lightmap to a custom size or scale.
+    ///
+    /// This can be used to significantly improve performance or achieve a pixeled lightmap effect.
+    ///
+    /// Also check the [`lightmap_filtering`](FireflyConfig::lightmap_filtering) field.
+    ///
+    /// **Default**: `LightmapSize::Window`.
+    pub lightmap_size: LightmapSize,
+
+    /// Enables lightmap filtering.
+    ///
+    /// When used in combination to [`lightmap_size`](FireflyConfig::lightmap_size),
+    /// this will determine whether, when upscaled to the screen size, the lightmap will
+    /// use linear or point filtering.
+    ///
+    /// Turn off to pixelate the lightmap.
+    ///
+    /// **Default**: true.
+    pub lightmap_filtering: bool,
+
+    /// Enables 32 bit sizes for the sprite stencil textures
+    /// (textures in which the sprite's z coordinate and other values are stored when
+    /// used in e.g. occluion z-sorting).
+    ///
+    /// Normally, WebGPU limits these to 16 bits, however, this can cause
+    /// imprecise z-sorting and normal maps since bevy's f32s will be limited to f16 precision.
+    ///
+    /// Enabling this fixes those precision issues; however, it will prevent your app
+    /// from running on web.    
+    ///
+    /// **Default**: false.
+    pub enable_32bit_stencils: bool,
+}
+
+/// Specifies how multiple textures will be combined.
+///
+/// **Default:** Multiply.
+#[derive(Clone, Copy, Reflect, Default, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CombinationMode {
+    #[default]
+    Multiply,
+    Max,
+    Min,
+    Add,
+    None,
+}
+
+#[derive(Clone, Copy, Reflect, Default, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LightmapSize {
+    #[default]
+    Window,
+    Fixed(UVec2),
+    Scaled(f32),
 }
 
 /// Options for how the normal maps should be read and used.
@@ -80,7 +142,8 @@ pub struct FireflyConfig {
 /// In order to fully use normal maps, you will need to add the [NormalMap](crate::prelude::NormalMap) component to Sprites.
 ///
 /// **Default:** [None](NormalMapMode::None).
-#[derive(Clone, Reflect)]
+#[derive(Debug, Clone, Reflect)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NormalMode {
     /// No normal maps will be used in rendering.
     None,
@@ -96,7 +159,9 @@ pub enum NormalMode {
     /// it will use the [LightHeight](crate::prelude::LightHeight) and [SpriteHeight](crate::prelude::SpriteHeight) components.
     ///
     /// This is recommended for 2d perspectives where you want to simulate 3d lighting, such as top-down games.
-    TopDown,
+    TopDownY,
+
+    TopDownZ,
 }
 
 impl Default for FireflyConfig {
@@ -105,10 +170,15 @@ impl Default for FireflyConfig {
             ambient_color: Color::Srgba(WHITE),
             ambient_brightness: 0.0,
             light_bands: None,
-            softness: Some(0.7),
+            soft_shadows: true,
             z_sorting: true,
+            z_sorting_error_margin: 0.0,
             normal_mode: NormalMode::None,
             normal_attenuation: 0.5,
+            combination_mode: CombinationMode::Multiply,
+            lightmap_size: LightmapSize::Window,
+            lightmap_filtering: true,
+            enable_32bit_stencils: false,
         }
     }
 }
@@ -119,8 +189,69 @@ pub struct UniformFireflyConfig {
     pub ambient_color: Vec3,
     pub ambient_brightness: f32,
     pub light_bands: f32,
-    pub softness: f32,
+    pub soft_shadows: u32,
     pub z_sorting: u32,
+    pub z_sorting_error_margin: f32,
     pub normal_mode: u32,
     pub normal_attenuation: f32,
+    pub n_combined_lightmaps: u32,
+    pub combination_mode: u32,
+    pub texture_scale: Vec2,
 }
+
+/// Add this **relationship** component to a camera in order to combine it's lightmap into the result of another lightmap.
+///
+/// ## Example
+/// ```
+/// let main_camera = commands.spawn((
+///     FireflyConfig {
+///         combination_mode: CombinationMode::Add,
+///         ..default()
+///     },
+///     Camera {
+///         msaa_writeback: MsaaWriteback::Off,
+///         ..default()
+///     }
+/// )).id();
+///
+/// commands.spawn((
+///     FireflyConfig::default(),
+///     Camera {
+///         order: -1,
+///         output_mode: CameraOutputMode::Skip,
+///         ..default()
+///     }
+///     CombineLightmapTo(main_camera)
+/// ));
+///
+/// commands.spawn((
+///     FireflyConfig::default(),
+///     Camera {
+///         order: -1,
+///         output_mode: CameraOutputMode::Skip,
+///         ..default()
+///     }
+///     CombineLightmapTo(main_camera)
+/// ));
+///
+/// ```
+///
+/// ## Limitations
+///
+/// A camera that is already the target of this relationship cannot combine its final result
+/// into another camera (only the pre-combination lightmap will be combined).
+///
+/// Ambient light from lightmaps is not transferred over when combined to other lightmaps.
+#[derive(Component)]
+#[relationship(relationship_target = CombinedLightmaps)]
+pub struct CombineLightmapTo(pub Entity);
+
+#[derive(Component)]
+#[relationship_target(relationship = CombineLightmapTo, linked_spawn)]
+pub struct CombinedLightmaps(Vec<Entity>);
+
+#[derive(Component)]
+pub struct ExtractedCombinedLightmaps(pub Vec<Entity>);
+
+#[derive(Component)]
+pub struct ExtractedCombineLightmapTo(pub Entity, pub u32);
