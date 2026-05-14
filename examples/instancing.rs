@@ -27,7 +27,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         Projection::Orthographic(proj),
         FireflyConfig {
             // normal maps need to be explicitly enabled
-            normal_mode: NormalMode::TopDown,
+            normal_mode: NormalMode::TopDownY,
             ambient_color: Color::srgb(1.0, 1.0, 1.0),
             ambient_brightness: 0.5,
             light_bands: Some(0.9),
@@ -87,8 +87,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         Anchor(Vec2::new(0.0, -10. / 32.)),
         PointLight2d {
             intensity: 10.,
-            range: 64.,
-            color: Color::srgb(1.0, 0.0, 0.0),
+            radius: 64.,
+            color: Color::srgb(1.0, 1.0, 1.0),
             ..default()
         },
         // component added to simulate height for the normal maps.
