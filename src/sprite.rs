@@ -2,7 +2,7 @@ use std::any::TypeId;
 
 use bevy::{
     asset::AsAssetId,
-    camera::visibility::{self, VisibilityClass},
+    camera::visibility::VisibilityClass,
     ecs::{lifecycle::HookContext, world::DeferredWorld},
     prelude::*,
     sprite::Anchor,
@@ -174,6 +174,8 @@ impl AsAssetId for FireflySprite {
 pub struct SpriteInstance {
     pub index: usize,
     pub offset: Vec2,
+    pub flip_x: Option<bool>,
+    pub flip_y: Option<bool>,
 }
 
 /// Controls how the image is altered when scaled.

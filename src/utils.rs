@@ -101,11 +101,16 @@ fn compute_sprite_slices(
             instances
                 .iter()
                 .map(|instance| {
-                    let slice_rect = layout.textures.get(instance.index)?.as_rect();
+                    let mut slice_rect = layout.textures.get(instance.index)?.as_rect();
+
+                    if instance.flip_x.is_some_and(|v| v) {
+                        std::mem::swap(&mut slice_rect.max.x, &mut slice_rect.min.x);
+                    }
+
                     Some(TextureSlice {
                         offset: instance.offset,
                         texture_rect: slice_rect,
-                        draw_size: slice_rect.size(),
+                        draw_size: slice_rect.size().abs(),
                     })
                 })
                 .collect::<Option<Vec<TextureSlice>>>()?

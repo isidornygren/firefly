@@ -28,6 +28,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         FireflyConfig {
             // normal maps need to be explicitly enabled
             normal_mode: NormalMode::TopDown,
+            ambient_color: Color::srgb(1.0, 1.0, 1.0),
+            ambient_brightness: 0.5,
+            light_bands: Some(0.9),
             ..default()
         },
     ));
@@ -51,10 +54,12 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                 SpriteInstance {
                     index: 0,
                     offset: Vec2::new(10., 0.),
+                    ..default()
                 },
                 SpriteInstance {
                     index: 1,
                     offset: Vec2::new(-10., -10.),
+                    ..default()
                 },
             ]),
             ..Default::default()
@@ -66,11 +71,24 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     ));
 
     commands.spawn((
-        FireflySprite::from_image(asset_server.load("bonfire.png")),
+        FireflySprite {
+            image: asset_server.load("statue.png"),
+            ..Default::default()
+        },
+        Anchor(vec2(0.0, -0.5 + 3.0 / 18.0)),
+        NormalMap::from_file("statue_normal.png", &asset_server),
+        Transform::from_translation(vec3(-20., -20., 0.)),
+        Occluder2d::rectangle(12., 5.1),
+    ));
+
+    commands.spawn((
+        FireflySprite::from_image(asset_server.load("statue.png")),
+        NormalMap::from_file("statue_normal.png", &asset_server),
+        Anchor(Vec2::new(0.0, -10. / 32.)),
         PointLight2d {
-            intensity: 3.,
-            range: 100.,
-            color: Color::srgb(1.0, 0.8, 0.6),
+            intensity: 10.,
+            range: 64.,
+            color: Color::srgb(1.0, 0.0, 0.0),
             ..default()
         },
         // component added to simulate height for the normal maps.
@@ -99,7 +117,7 @@ fn drag_objects(
 ) {
     let Some(cursor_position) = window
         .cursor_position()
-        .and_then(|cursor| camera.0.viewport_to_world_2d(&camera.1, cursor).ok())
+        .and_then(|cursor| camera.0.viewport_to_world_2d(camera.1, cursor).ok())
     else {
         dragged.0 = None;
         return;
